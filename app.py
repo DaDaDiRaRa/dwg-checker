@@ -1,47 +1,53 @@
 """
-app.py
-======
-Two-way cross-check between a master "PDF Drawing List" and the actual
-CAD drawings (DWG / DXF) in a target directory.
+app.py  —  PDF <-> CAD Drawing Cross-Check  (V6)
+================================================
+Compares a master "PDF Drawing List" against the actual CAD drawings
+(.dwg / .dxf) living in a directory, without moving or copying any files
+(so external references / Xref paths remain intact).
 
 Pipeline
 --------
-1. Prompt the user for the Title Block block name (CLI `input()`).
-2. Read the drawing list PDF table into a pandas DataFrame
-   (Drawing Number / Drawing Name / Scale) using pdfplumber.
-3. Parse every .dwg / .dxf in the target directory with ezdxf
-   (no AutoCAD required). For every INSERT that matches the
-   user-supplied Title Block name:
-       - compute its real bounding box with ezdxf.bbox
-       - build the "Drawing Number / Drawing Name" search rectangle
-         using the bottom-right corner (Max_X, Min_Y) and the
-         tweakable X_RATIO / Y_RATIO constants defined below
-       - collect TEXT / MTEXT entities whose insertion / center
-         point falls inside that rectangle
-       - pair them up into Drawing Number + Drawing Name
-4. Outer-merge PDF and DWG data on Drawing Number, write the result
-   to report.xlsx and highlight any Drawing Name / Scale mismatch
-   cells with a red background.
+1. Interactive prompts:
+      TARGET_DIR   - full directory path holding the DWG files
+      PDF_PATH     - full path of the master PDF drawing list
+      BLOCK_NAME   - name of the Title Block to search for
+2. PDF extraction      : pdfplumber -> pandas DataFrame
+                         [Drawing Number, Drawing Name, Scale]
+3. DWG extraction      : ezdxf, Model Space only
+      * os.chdir(TARGET_DIR) so relative xref paths resolve naturally
+      * find every INSERT whose block name matches BLOCK_NAME
+      * compute its bounding box via ezdxf.bbox.extents
+      * build a search window anchored at the bottom-right corner
+        (Max_X, Min_Y) using the global X_RATIO / Y_RATIO constants
+      * collect TEXT / MTEXT entities whose insertion point lies inside
+        that window, then pair them into Drawing Number + Drawing Name
+4. Compare & Report   : outer-merge on Drawing Number, write report.xlsx
+                        and highlight Drawing Name / Scale mismatches in red
 
-Usage
------
-    python app.py
-    python app.py --pdf drawing_list.pdf --dwg-dir ./dwg --out report.xlsx
+Xref note
+---------
+ezdxf reads entity data straight from the *host* DWG. If the Title Block
+itself is an Xref, the INSERT entity still lives in the host file, so it
+is picked up by ``msp.query("INSERT")`` as usual. However, text that
+resides *inside* an unresolved xref cannot be read without loading the
+xref body — this script intentionally operates only on the host's
+coordinate system and the host's own TEXT / MTEXT entities.
 
-Notes
------
-* Reading *.dwg* directly requires ezdxf's `odafc` addon, which shells
-  out to the free "ODA File Converter" utility. If you only have DXF
-  files that step is skipped entirely - ezdxf reads DXF natively.
+DWG note
+--------
+ezdxf reads .dxf files natively. To read binary .dwg directly the free
+ODA File Converter is required (``ezdxf.addons.odafc``). If it is not
+installed, batch-convert the .dwg files to .dxf first — the script
+happily processes whichever extension it finds in the directory.
 """
 
 from __future__ import annotations
 
-import argparse
 import glob
 import os
 import re
 import sys
+import traceback
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -54,31 +60,67 @@ from openpyxl.styles import PatternFill
 
 
 # ============================================================================
-# GLOBAL TWEAKABLE RATIOS  (requirement #3 - "extract as global variables")
+# GLOBAL TWEAKABLE RATIOS  (requirement: expose as top-level constants)
 # ============================================================================
-# Search rectangle width  = Title-Block Width  * X_RATIO  (to the LEFT of Max_X)
-# Search rectangle height = Title-Block Height * Y_RATIO  (ABOVE Min_Y)
-X_RATIO: float = 0.101    # 10.1 %
-Y_RATIO: float = 0.2138   # 21.38 %
+X_RATIO: float = 0.101    # 10.10 %  search width  = Title-Block Width  * X_RATIO
+Y_RATIO: float = 0.2138   # 21.38 %  search height = Title-Block Height * Y_RATIO
 
 
-# ============================================================================
-# Defaults - can be overridden with CLI flags
-# ============================================================================
-DEFAULT_PDF_PATH = "drawing_list.pdf"
-DEFAULT_DWG_DIR  = "./dwg"
-DEFAULT_REPORT   = "report.xlsx"
-
-
-# Regex used to separate "Drawing Number" (e.g. A-101, S_002, MEP-12B)
-# from the longer descriptive "Drawing Name".
+# Regex used to separate a short "Drawing Number" (A-101, S_002, MEP-12B ...)
+# from longer descriptive "Drawing Name" strings.
 _DRAWING_NUMBER_RE = re.compile(
     r"^[A-Za-z]{0,5}[-_]?\d{1,5}[A-Za-z0-9\-_.]*$"
 )
 
+# Default name of the Excel report (written to the cwd where app.py is run).
+REPORT_NAME = "report.xlsx"
+
 
 # ============================================================================
-# 1. PDF EXTRACTION
+# 1.  INTERACTIVE CLI PROMPTS
+# ============================================================================
+def _prompt_path(label: str, *, must_be_dir: bool = False,
+                 must_be_file: bool = False) -> str:
+    """Prompt the user for a filesystem path and validate it."""
+    while True:
+        raw = input(label).strip().strip('"').strip("'")
+        if not raw:
+            print("    ! Empty input. Please try again.")
+            continue
+        path = os.path.expanduser(os.path.expandvars(raw))
+        if must_be_dir and not os.path.isdir(path):
+            print(f"    ! Not a valid directory: {path}")
+            continue
+        if must_be_file and not os.path.isfile(path):
+            print(f"    ! Not a valid file: {path}")
+            continue
+        return os.path.abspath(path)
+
+
+def prompt_inputs() -> Tuple[str, str, str]:
+    """Collect TARGET_DIR, PDF_PATH and BLOCK_NAME from the user."""
+    print("=" * 72)
+    print(" PDF <-> CAD Drawing Cross-Check")
+    print("=" * 72)
+
+    target_dir = _prompt_path(
+        "Enter the full directory path that contains the DWG files: ",
+        must_be_dir=True,
+    )
+    pdf_path = _prompt_path(
+        "Enter the full path of the master PDF drawing list: ",
+        must_be_file=True,
+    )
+    block_name = input("Enter the Name of the Title Block to search for: ").strip()
+    if not block_name:
+        print("[ERROR] Title block name cannot be empty.")
+        sys.exit(1)
+
+    return target_dir, pdf_path, block_name
+
+
+# ============================================================================
+# 2.  PDF EXTRACTION
 # ============================================================================
 def _find_col(header: List[str], keys: List[str]) -> Optional[int]:
     """Return the index of the first header cell containing any of *keys*."""
@@ -91,106 +133,132 @@ def _find_col(header: List[str], keys: List[str]) -> Optional[int]:
 
 def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
     """
-    Read every table on every page of *pdf_path* and return a DataFrame
+    Parse every table on every page of *pdf_path* and return a DataFrame
     with columns ``Drawing Number``, ``Drawing Name``, ``Scale``.
     """
-    if not os.path.isfile(pdf_path):
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    print(f"[PDF ] Opening: {pdf_path}")
+    rows: List[dict] = []
 
-    rows = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            for table in page.extract_tables() or []:
-                if not table or len(table) < 2:
-                    continue
-
-                header = [(c or "").strip().lower() for c in table[0]]
-                idx_no    = _find_col(header, ["drawing number", "dwg no", "dwg. no", "no."])
-                idx_name  = _find_col(header, ["drawing name", "drawing title", "title", "name"])
-                idx_scale = _find_col(header, ["scale"])
-
-                if idx_no is None or idx_name is None:
-                    continue  # not a drawing-list table
-
-                for raw in table[1:]:
-                    if not raw or all((c or "").strip() == "" for c in raw):
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_no, page in enumerate(pdf.pages, 1):
+                tables = page.extract_tables() or []
+                page_count_before = len(rows)
+                for table in tables:
+                    if not table or len(table) < 2:
                         continue
-                    number = (raw[idx_no]   or "").strip() if idx_no   < len(raw) else ""
-                    name   = (raw[idx_name] or "").strip() if idx_name < len(raw) else ""
-                    scale  = ""
-                    if idx_scale is not None and idx_scale < len(raw):
-                        scale = (raw[idx_scale] or "").strip()
-                    if not number:
-                        continue
-                    rows.append({
-                        "Drawing Number": number,
-                        "Drawing Name":   name,
-                        "Scale":          scale,
-                    })
+
+                    header = [(c or "").strip().lower() for c in table[0]]
+                    idx_no    = _find_col(header, ["drawing number", "dwg no",
+                                                   "dwg. no", "no."])
+                    idx_name  = _find_col(header, ["drawing name", "drawing title",
+                                                   "title", "name"])
+                    idx_scale = _find_col(header, ["scale"])
+
+                    if idx_no is None or idx_name is None:
+                        continue  # not a drawing-list table
+
+                    for raw in table[1:]:
+                        if not raw or all((c or "").strip() == "" for c in raw):
+                            continue
+                        number = (raw[idx_no]   or "").strip() if idx_no   < len(raw) else ""
+                        name   = (raw[idx_name] or "").strip() if idx_name < len(raw) else ""
+                        scale  = ""
+                        if idx_scale is not None and idx_scale < len(raw):
+                            scale = (raw[idx_scale] or "").strip()
+                        if not number:
+                            continue
+                        rows.append({
+                            "Drawing Number": number,
+                            "Drawing Name":   name,
+                            "Scale":          scale,
+                        })
+
+                added = len(rows) - page_count_before
+                print(f"[PDF ] Page {page_no}: +{added} rows (total {len(rows)})")
+
+    except FileNotFoundError:
+        print(f"[ERROR] PDF not found: {pdf_path}")
+        raise
+    except Exception as exc:
+        print(f"[ERROR] Failed to read PDF: {exc}")
+        raise
 
     df = pd.DataFrame(rows, columns=["Drawing Number", "Drawing Name", "Scale"])
     if not df.empty:
         df = df.drop_duplicates(subset=["Drawing Number"]).reset_index(drop=True)
+    print(f"[PDF ] Extracted {len(df)} unique drawings")
     return df
 
 
 # ============================================================================
-# 2. DWG / DXF EXTRACTION
+# 3.  DWG / DXF EXTRACTION  (Model Space only)
 # ============================================================================
 def _load_doc(path: Path):
-    """Load a DXF directly, or convert a DWG on-the-fly via ODA File Converter."""
+    """Load a .dxf natively or a .dwg via the ODA File Converter addon."""
     suffix = path.suffix.lower()
     if suffix == ".dxf":
         return ezdxf.readfile(str(path))
     if suffix == ".dwg":
-        # Requires the ODA File Converter to be installed on the system.
-        from ezdxf.addons import odafc
+        from ezdxf.addons import odafc  # requires ODA File Converter on PATH
         return odafc.readfile(str(path))
     raise ValueError(f"Unsupported CAD file extension: {suffix}")
 
 
 def _entity_point(ent) -> Optional[Tuple[float, float]]:
-    """Return a representative (x, y) point for a TEXT or MTEXT entity."""
+    """Return a representative (x, y) insertion point for TEXT / MTEXT."""
     t = ent.dxftype()
-    if t == "TEXT":
-        # Prefer the align point when the text is non-default aligned.
-        try:
-            if ent.dxf.halign or ent.dxf.valign:
+    try:
+        if t == "TEXT":
+            # Use align_point when the text is non-default aligned.
+            if getattr(ent.dxf, "halign", 0) or getattr(ent.dxf, "valign", 0):
                 p = ent.dxf.align_point
             else:
                 p = ent.dxf.insert
-        except AttributeError:
+            return (float(p[0]), float(p[1]))
+        if t == "MTEXT":
             p = ent.dxf.insert
-        return (float(p[0]), float(p[1]))
-    if t == "MTEXT":
-        p = ent.dxf.insert
-        return (float(p[0]), float(p[1]))
+            return (float(p[0]), float(p[1]))
+    except Exception:
+        return None
     return None
 
 
 def _entity_text(ent) -> str:
+    """Return the plain text content of a TEXT / MTEXT entity."""
     t = ent.dxftype()
-    if t == "TEXT":
-        return (ent.dxf.text or "").strip()
-    if t == "MTEXT":
-        try:
+    try:
+        if t == "TEXT":
+            return (ent.dxf.text or "").strip()
+        if t == "MTEXT":
             return ent.plain_text().strip()
-        except Exception:
-            return (ent.text or "").strip()
+    except Exception:
+        return ""
     return ""
 
 
-def _pair_number_and_name(hits: List[Tuple[float, float, str]]) -> Tuple[str, str]:
-    """
-    From the texts that fall inside the title-block search rectangle,
-    decide which one is the *Drawing Number* and which one is the
-    *Drawing Name*. Strategy:
+def _compute_insert_bbox(insert):
+    """Return the bounding box of an INSERT or None if it cannot be computed."""
+    try:
+        box = bbox.extents([insert])
+        if box.has_data:
+            return box
+    except Exception:
+        pass
+    return None
 
-    1. Use a regex to spot drawing-number-looking strings (short,
-       alphanumeric, at least one digit).
-    2. Everything else is a candidate for Drawing Name.
-    3. Fall back to positional logic (topmost text = number) if the
-       regex yields nothing useful.
+
+def _pair_number_and_name(
+    hits: List[Tuple[float, float, str]],
+) -> Tuple[str, str]:
+    """
+    Pick Drawing Number / Drawing Name out of the texts that fell inside
+    the search rectangle. Strategy:
+
+    1. A short alphanumeric token containing a digit -> Drawing Number.
+    2. The remaining (longer descriptive) text -> Drawing Name.
+    3. Fallback: if the regex yields nothing, sort by Y descending and
+       use the two topmost strings.
     """
     if not hits:
         return "", ""
@@ -205,109 +273,123 @@ def _pair_number_and_name(hits: List[Tuple[float, float, str]]) -> Tuple[str, st
             others.append((x, y, text))
 
     if numbers and others:
-        # Prefer the topmost candidate in each bucket so we pick the
-        # most prominent line within the sub-rectangle.
-        numbers.sort(key=lambda h: -h[1])
+        numbers.sort(key=lambda h: -h[1])  # topmost first
         others.sort(key=lambda h: -h[1])
         return numbers[0][2], others[0][2]
 
-    # Positional fallback - topmost is drawing number.
     hits_sorted = sorted(hits, key=lambda h: -h[1])
     if len(hits_sorted) >= 2:
         return hits_sorted[0][2], hits_sorted[1][2]
     return hits_sorted[0][2], ""
 
 
-def extract_dwg_data(dwg_dir: str, title_block_name: str) -> pd.DataFrame:
+def extract_dwg_data(target_dir: str, block_name: str) -> pd.DataFrame:
     """
-    Walk *dwg_dir* recursively and extract Drawing Number / Drawing Name
-    for every INSERT whose block name matches *title_block_name*.
+    Walk *target_dir* and, for every INSERT whose block name matches
+    *block_name* in the host Model Space, derive Drawing Number /
+    Drawing Name from TEXT / MTEXT inside the ratio-based search window.
     """
-    if not os.path.isdir(dwg_dir):
-        raise FileNotFoundError(f"CAD directory not found: {dwg_dir}")
-
-    patterns = ("*.dxf", "*.DXF", "*.dwg", "*.DWG")
-    files: List[str] = []
-    for pat in patterns:
-        files.extend(glob.glob(os.path.join(dwg_dir, "**", pat), recursive=True))
-    files = sorted(set(files))
-
-    if not files:
-        print(f"[WARN] no .dwg/.dxf files found in {dwg_dir}")
-        return pd.DataFrame(columns=["Source File", "Drawing Number", "Drawing Name"])
-
-    target = title_block_name.strip().lower()
+    target_block = block_name.strip().lower()
     rows: List[dict] = []
 
-    for f in files:
-        path = Path(f)
-        try:
-            doc = _load_doc(path)
-        except Exception as exc:
-            print(f"[WARN] cannot open {path.name}: {exc}")
-            continue
+    # 3a. Discover CAD files (prefer .dwg per spec, also accept .dxf)
+    cad_files: List[str] = []
+    for pat in ("*.dwg", "*.DWG", "*.dxf", "*.DXF"):
+        cad_files.extend(glob.glob(os.path.join(target_dir, pat)))
+    cad_files = sorted(set(cad_files))
 
-        msp = doc.modelspace()
+    empty = pd.DataFrame(columns=["Source File", "Drawing Number", "Drawing Name"])
+    if not cad_files:
+        print(f"[WARN] No .dwg / .dxf files found in {target_dir}")
+        return empty
 
-        # 2a. Find every INSERT that matches the requested title block.
-        tb_inserts = [
-            ins for ins in msp.query("INSERT")
-            if ins.dxf.name.strip().lower() == target
-        ]
-        if not tb_inserts:
-            print(f"[INFO] '{title_block_name}' not found in {path.name}")
-            continue
+    # 3b. chdir into the target directory so Xref relative paths resolve.
+    prev_cwd = os.getcwd()
+    try:
+        os.chdir(target_dir)
+        print(f"[CAD ] Working directory: {os.getcwd()}")
+        print(f"[CAD ] Files discovered : {len(cad_files)}")
 
-        # Cache ALL text entities once per file (faster than querying
-        # per title-block instance).
-        text_entities = list(msp.query("TEXT MTEXT"))
+        for idx, full_path in enumerate(cad_files, 1):
+            fname = os.path.basename(full_path)
+            print(f"[CAD ] ({idx}/{len(cad_files)}) Processing {fname} ...",
+                  end=" ", flush=True)
 
-        for tb in tb_inserts:
-            # 2b. Real bounding box of *this* INSERT
-            box = bbox.extents([tb])
-            if not box.has_data:
-                print(f"[WARN] bbox unavailable for a title block in {path.name}")
+            # ---- open ------------------------------------------------------
+            try:
+                doc = _load_doc(Path(fname))
+            except Exception as exc:
+                print(f"FAILED to open ({exc})")
                 continue
 
-            min_x, min_y = float(box.extmin.x), float(box.extmin.y)
-            max_x, max_y = float(box.extmax.x), float(box.extmax.y)
-            width  = max_x - min_x
-            height = max_y - min_y
-            if width <= 0 or height <= 0:
-                continue
+            # ---- scan model space ------------------------------------------
+            try:
+                msp = doc.modelspace()
 
-            # 2c. Search rectangle anchored at bottom-right corner.
-            #     Bottom-right corner = (Max_X, Min_Y)
-            #     Expand LEFT  by width  * X_RATIO
-            #     Expand UP    by height * Y_RATIO
-            sx_max = max_x
-            sx_min = max_x - width  * X_RATIO
-            sy_min = min_y
-            sy_max = min_y + height * Y_RATIO
-
-            # 2d. Filter text entities whose insertion point sits inside
-            #     the search rectangle.
-            hits: List[Tuple[float, float, str]] = []
-            for ent in text_entities:
-                pt = _entity_point(ent)
-                if pt is None:
+                tb_inserts = [
+                    ins for ins in msp.query("INSERT")
+                    if ins.dxf.name.strip().lower() == target_block
+                ]
+                if not tb_inserts:
+                    print(f"no '{block_name}' in model space")
                     continue
-                x, y = pt
-                if sx_min <= x <= sx_max and sy_min <= y <= sy_max:
-                    content = _entity_text(ent)
-                    if content:
-                        hits.append((x, y, content))
 
-            if not hits:
-                print(f"[INFO] no texts inside search box of {path.name}")
-                continue
+                text_entities = list(msp.query("TEXT MTEXT"))
+                file_rows = 0
 
-            dwg_no, dwg_name = _pair_number_and_name(hits)
-            rows.append({
-                "Source File":    path.name,
-                "Drawing Number": dwg_no,
-                "Drawing Name":   dwg_name,
-            })
+                for tb in tb_inserts:
+                    box = _compute_insert_bbox(tb)
+                    if box is None:
+                        # Likely an unresolved xref - cannot derive its extents.
+                        continue
+
+                    min_x = float(box.extmin.x)
+                    min_y = float(box.extmin.y)
+                    max_x = float(box.extmax.x)
+                    max_y = float(box.extmax.y)
+                    width  = max_x - min_x
+                    height = max_y - min_y
+                    if width <= 0 or height <= 0:
+                        continue
+
+                    # Search rectangle anchored at bottom-right (Max_X, Min_Y)
+                    sx_max = max_x
+                    sx_min = max_x - width  * X_RATIO
+                    sy_min = min_y
+                    sy_max = min_y + height * Y_RATIO
+
+                    hits: List[Tuple[float, float, str]] = []
+                    for ent in text_entities:
+                        pt = _entity_point(ent)
+                        if pt is None:
+                            continue
+                        x, y = pt
+                        if sx_min <= x <= sx_max and sy_min <= y <= sy_max:
+                            content = _entity_text(ent)
+                            if content:
+                                hits.append((x, y, content))
+
+                    if not hits:
+                        continue
+
+                    dwg_no, dwg_name = _pair_number_and_name(hits)
+                    if dwg_no or dwg_name:
+                        rows.append({
+                            "Source File":    fname,
+                            "Drawing Number": dwg_no,
+                            "Drawing Name":   dwg_name,
+                        })
+                        file_rows += 1
+
+                print(f"Done ({file_rows} drawings, "
+                      f"{len(tb_inserts)} title-block instances)")
+
+            except Exception as exc:
+                print(f"FAILED (unexpected error: {exc})")
+                traceback.print_exc()
+
+    finally:
+        os.chdir(prev_cwd)
 
     df = pd.DataFrame(rows, columns=["Source File", "Drawing Number", "Drawing Name"])
     if not df.empty:
@@ -316,15 +398,15 @@ def extract_dwg_data(dwg_dir: str, title_block_name: str) -> pd.DataFrame:
             .drop_duplicates(subset=["Drawing Number"])
             .reset_index(drop=True)
         )
+    print(f"[CAD ] Total unique drawings extracted: {len(df)}")
     return df
 
 
 # ============================================================================
-# 3. COMPARE & WRITE EXCEL REPORT
+# 4.  COMPARE & WRITE EXCEL REPORT
 # ============================================================================
 def build_report(pdf_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str) -> None:
-    """Merge the two DataFrames, write to Excel and highlight mismatches."""
-    # Rename so Drawing Name / Scale become *_PDF / *_DWG side by side.
+    """Outer-merge the two datasets and write a highlighted report.xlsx."""
     pdf = pdf_df.rename(columns={
         "Drawing Name": "Drawing Name (PDF)",
         "Scale":        "Scale (PDF)",
@@ -335,7 +417,7 @@ def build_report(pdf_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str) -> N
 
     merged = pdf.merge(dwg, on="Drawing Number", how="outer", indicator=True)
 
-    # Guarantee column order / existence.
+    # Guarantee columns exist even when one side is empty.
     for col in ["Drawing Name (PDF)", "Drawing Name (DWG)",
                 "Scale (PDF)", "Source File"]:
         if col not in merged.columns:
@@ -357,17 +439,17 @@ def build_report(pdf_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str) -> N
 
     merged.to_excel(out_path, index=False)
 
-    # ----- highlight mismatches with openpyxl ----------------------------
+    # ---- highlight mismatches with openpyxl --------------------------------
     red = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
     wb  = load_workbook(out_path)
     ws  = wb.active
 
-    header_row = {cell.value: cell.column for cell in ws[1]}
-    col_no        = header_row["Drawing Number"]
-    col_name_pdf  = header_row["Drawing Name (PDF)"]
-    col_name_dwg  = header_row["Drawing Name (DWG)"]
-    col_scale     = header_row["Scale (PDF)"]
-    col_status    = header_row["Match Status"]
+    header_row   = {cell.value: cell.column for cell in ws[1]}
+    col_no       = header_row["Drawing Number"]
+    col_name_pdf = header_row["Drawing Name (PDF)"]
+    col_name_dwg = header_row["Drawing Name (DWG)"]
+    col_scale    = header_row["Scale (PDF)"]
+    col_status   = header_row["Match Status"]
 
     for row in range(2, ws.max_row + 1):
         status   = ws.cell(row=row, column=col_status).value or ""
@@ -375,63 +457,66 @@ def build_report(pdf_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str) -> N
         name_dwg = (ws.cell(row=row, column=col_name_dwg).value or "").strip()
         scale    = (ws.cell(row=row, column=col_scale).value    or "").strip()
 
-        # (a) drawing number missing on one side -> paint the whole row.
+        # (a) drawing missing on one side -> paint whole row
         if status in ("DWG MISSING", "PDF MISSING"):
             for c in (col_no, col_name_pdf, col_name_dwg, col_scale, col_status):
                 ws.cell(row=row, column=c).fill = red
             continue
 
-        # (b) drawing name mismatch on a matched pair.
+        # (b) drawing name mismatch between PDF and DWG
         if name_pdf.lower() != name_dwg.lower():
             ws.cell(row=row, column=col_name_pdf).fill = red
             ws.cell(row=row, column=col_name_dwg).fill = red
 
-        # (c) scale value missing / blank on a matched pair.
+        # (c) scale missing on a matched row
         if scale == "":
             ws.cell(row=row, column=col_scale).fill = red
 
     wb.save(out_path)
-    print(f"[OK] Report saved to {out_path}")
+    print(f"[XLSX] Report saved: {out_path}")
 
 
 # ============================================================================
-# 4. CLI
+# 5.  MAIN
 # ============================================================================
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Cross-check a PDF drawing list against CAD drawings."
-    )
-    p.add_argument("--pdf",     default=DEFAULT_PDF_PATH,
-                   help=f"Path to the master PDF (default: {DEFAULT_PDF_PATH})")
-    p.add_argument("--dwg-dir", default=DEFAULT_DWG_DIR,
-                   help=f"Directory holding .dwg/.dxf files (default: {DEFAULT_DWG_DIR})")
-    p.add_argument("--out",     default=DEFAULT_REPORT,
-                   help=f"Output Excel path (default: {DEFAULT_REPORT})")
-    return p.parse_args()
-
-
 def main() -> None:
-    args = _parse_args()
+    target_dir, pdf_path, block_name = prompt_inputs()
 
-    # Requirement #1 - runtime prompt
-    title_block_name = input("Enter the Name of the Title Block to search for: ").strip()
-    if not title_block_name:
-        print("[ERROR] Title block name cannot be empty.")
+    print("-" * 72)
+    print(f"[INFO] Target dir : {target_dir}")
+    print(f"[INFO] PDF path   : {pdf_path}")
+    print(f"[INFO] Block name : {block_name}")
+    print("-" * 72)
+
+    # Resolve the output path now, before we chdir into target_dir.
+    out_path = os.path.abspath(REPORT_NAME)
+
+    try:
+        pdf_df = extract_pdf_table(pdf_path)
+    except Exception as exc:
+        print(f"[FATAL] PDF extraction aborted: {exc}")
         sys.exit(1)
 
-    print(f"[INFO] Parsing PDF drawing list: {args.pdf}")
-    pdf_df = extract_pdf_table(args.pdf)
-    print(f"       -> {len(pdf_df)} rows from PDF")
-
-    print(f"[INFO] Scanning CAD files in: {args.dwg_dir}")
-    dwg_df = extract_dwg_data(args.dwg_dir, title_block_name)
-    print(f"       -> {len(dwg_df)} drawings extracted from CAD")
+    try:
+        dwg_df = extract_dwg_data(target_dir, block_name)
+    except Exception as exc:
+        print(f"[FATAL] DWG extraction aborted: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
 
     if pdf_df.empty and dwg_df.empty:
-        print("[ERROR] Both PDF and DWG datasets are empty - aborting.")
+        print("[ERROR] Both datasets are empty. Nothing to compare.")
         sys.exit(1)
 
-    build_report(pdf_df, dwg_df, args.out)
+    try:
+        build_report(pdf_df, dwg_df, out_path)
+    except Exception as exc:
+        print(f"[FATAL] Report generation failed: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    print("-" * 72)
+    print("[DONE] All tasks completed successfully.")
 
 
 if __name__ == "__main__":
