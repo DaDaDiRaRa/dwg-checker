@@ -1,14 +1,14 @@
 """
-app.py  —  DWG 자동 검토기 v_1.1 (LISP 연동형 최종)
+app.py  —  DWG 자동 검토기 v_1.4 (LISP 연동형 + 스마트 매칭 + 회전 감지)
 ========================================================================
-[V1.1 주요 업데이트]
-1. 원본 사이즈 자동 인식: 사용자가 가로/세로 길이를 입력할 필요 없이 LISP이 측정한 값을 자동 적용.
-2. 입력 간소화: 블록명, 목록표 경로, 폴더 경로 딱 3개만 입력하면 자동 실행.
+[V1.4 주요 업데이트]
+1. 회전 감지 레이더(Rotation Matrix) 탑재: 세로로 90도 회전된 도곽이라도
+   글자 좌표를 역회전(Un-rotate) 시켜 정확히 ROI 구역을 찾아냅니다.
 ========================================================================
 """
 
 from __future__ import annotations
-import glob, os, re, sys, webbrowser, json
+import glob, os, re, sys, webbrowser, json, math
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
@@ -134,7 +134,7 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
     return 결과
 
 # ============================================================================
-# 2. 목록표 (DWG) 파싱 로직
+# 2. 목록표 (DWG) 파싱 로직 (회전 감지 적용)
 # ============================================================================
 def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
     texts = []
@@ -223,11 +223,31 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
                 ix, iy = float(도곽.dxf.insert.x), float(도곽.dxf.insert.y)
                 xscale, yscale = abs(float(도곽.dxf.xscale)), abs(float(도곽.dxf.yscale))
                 너비, 높이 = base_w * xscale, base_h * yscale
+                
+                # [회전 레이더] 회전 각도를 가져와서 역회전용 삼각함수 세팅
+                rot_deg = getattr(도곽.dxf, 'rotation', 0.0)
+                rad = math.radians(-rot_deg) # -를 붙여 반대로 돌림
+                cos_val, sin_val = math.cos(rad), math.sin(rad)
+
                 col_ranges = [(ix + (너비 * 0.05758), ix + (너비 * 0.28946)), (ix + (너비 * 0.47970), ix + (너비 * 0.71159))]
                 y_min, y_max = iy + (높이 * 0.05235), iy + (높이 * 0.92600)
+                
                 for min_x, max_x in col_ranges:
-                    구역_텍스트 = sorted([t for t in 모든텍스트 if min_x <= t[0] <= max_x and y_min <= t[1] <= y_max], key=lambda x: -x[1])
+                    구역_텍스트 = []
+                    for t in 모든텍스트:
+                        tx, ty, txt, th = t
+                        # 텍스트 좌표를 삽입점 기준으로 역회전(Un-rotate)시킵니다.
+                        dx, dy = tx - ix, ty - iy
+                        unrot_x = ix + (dx * cos_val - dy * sin_val)
+                        unrot_y = iy + (dx * sin_val + dy * cos_val)
+                        
+                        if min_x <= unrot_x <= max_x and y_min <= unrot_y <= y_max:
+                            # 정렬을 위해 역회전된 좌표를 저장합니다.
+                            구역_텍스트.append((unrot_x, unrot_y, txt, th))
+                            
                     if not 구역_텍스트: continue
+                    구역_텍스트.sort(key=lambda x: -x[1]) # Y축 위에서 아래로
+                    
                     줄목록, 현재_줄, 현재_y, y_tol = [], [], None, 높이 * 0.012
                     for t in 구역_텍스트:
                         if 현재_y is None or abs(현재_y - t[1]) <= y_tol: 현재_y = t[1]; 현재_줄.append(t)
@@ -246,7 +266,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
     return df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
 
 # ============================================================================
-# 3. 개별 도면 (DWG) 파싱 (LISP ROI 적용)
+# 3. 개별 도면 (DWG) 파싱 (LISP ROI + 회전 감지 적용)
 # ============================================================================
 def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List[dict], str]:
     전체경로, 목표블록, roi_cfg, base_w, base_h = args
@@ -275,11 +295,28 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 xscale, yscale = abs(float(도곽.dxf.xscale)), abs(float(도곽.dxf.yscale))
                 너비, 높이 = base_w * xscale, base_h * yscale
 
+                # [회전 레이더] 개별 도곽의 회전을 감지하여 역회전 행렬 준비
+                rot_deg = getattr(도곽.dxf, 'rotation', 0.0)
+                rad = math.radians(-rot_deg)
+                cos_val, sin_val = math.cos(rad), math.sin(rad)
+
                 def get_txt_in_roi(roi):
                     x_min, x_max = ix + (너비 * roi[0]), ix + (너비 * roi[1])
                     y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3])
                     
-                    박스내글자 = [t for t in 모든텍스트 if x_min <= t[0] <= x_max and y_min <= t[1] <= y_max]
+                    박스내글자 = []
+                    for t in 모든텍스트:
+                        tx, ty, txt, th = t
+                        # 텍스트 좌표를 삽입점 기준으로 역회전(Un-rotate)시킵니다.
+                        dx, dy = tx - ix, ty - iy
+                        unrot_x = ix + (dx * cos_val - dy * sin_val)
+                        unrot_y = iy + (dx * sin_val + dy * cos_val)
+                        
+                        if x_min <= unrot_x <= x_max and y_min <= unrot_y <= y_max:
+                            # 정렬을 위해 역회전된 X, Y 위치를 넣습니다.
+                            박스내글자.append((unrot_x, unrot_y, txt))
+                            
+                    # 역회전된 좌표계에서 Y(위에서 아래), X(좌에서 우)로 정렬
                     박스내글자.sort(key=lambda t: (-t[1], t[0]))
                     return " ".join([t[2] for t in 박스내글자])
 
@@ -290,17 +327,32 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 번호_후보 = _extract_drawing_number(n_str)
                 번호 = _도면번호_세척(번호_후보) if 번호_후보 else ""
                 
-                명칭 = re.sub(r"\bA1\b|\bA3\b|NONE|N/A", "", t_str, flags=re.IGNORECASE)
+                명칭 = t_str
+                if 번호_후보:
+                    명칭 = 명칭.replace(번호_후보, "")
+                    
+                명칭 = re.sub(r"\bA1\b|\bA3\b|NONE|N/A", "", 명칭, flags=re.IGNORECASE)
                 명칭 = re.sub(r"1\s?[/:,]\s?\d{1,4}", "", 명칭, flags=re.IGNORECASE).strip(" ,")
+                명칭 = re.sub(r"\s+", " ", 명칭)
                 
-                a1 = _축척_텍스트_정리(s_str)
-                a3 = "X"
+                matches = list(_축척_패턴.finditer(s_str.upper()))
+                a1, a3 = "X", "X"
+                
+                if matches:
+                    val1 = matches[0].group(2)
+                    a1 = f"1/{val1}" if val1 else "NONE"
+                    if len(matches) >= 2:
+                        val2 = matches[1].group(2)
+                        a3 = f"1/{val2}" if val2 else "NONE"
+                
+                if a1 == "X" and ("NONE" in s_str.upper() or "N/A" in s_str.upper()):
+                    a1, a3 = "NONE", "NONE"
 
                 if 번호: 
                     데이터.append({
                         "파일명": 파일명, 
                         "도면번호(DWG)": 번호, 
-                        "도면명(DWG)": re.sub(r"\s+", " ", 명칭).strip(), 
+                        "도면명(DWG)": 명칭.strip(), 
                         "축척_A1(DWG)": a1, 
                         "축척_A3(DWG)": a3
                     })
@@ -348,8 +400,8 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
     if "도면번호(LIST)" not in lst.columns: lst["도면번호(LIST)"] = ""
     if "도면번호(DWG)" not in dwg.columns: dwg["도면번호(DWG)"] = ""
 
-    lst["KEY"] = lst["도면번호(LIST)"].astype(str).str.replace(" ", "")
-    dwg["KEY"] = dwg["도면번호(DWG)"].astype(str).str.replace(" ", "")
+    lst["KEY"] = lst["도면번호(LIST)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
+    dwg["KEY"] = dwg["도면번호(DWG)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
     
     결과 = pd.merge(lst, dwg, on="KEY", how="outer", indicator=True)
     결과["상태"] = 결과["_merge"].map({"both": "일치", "left_only": "DWG 누락", "right_only": "목록표 누락"})
@@ -367,7 +419,10 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
         if ws.cell(row, h["상태"]).value != "일치":
             for c in range(1, len(cols)+1): ws.cell(row, c).fill = 빨간색
         else:
-            if str(ws.cell(row, h.get("도면번호(LIST)")).value).replace(" ", "") != str(ws.cell(row, h.get("도면번호(DWG)")).value).replace(" ", ""):
+            val_list = re.sub(r"[\s\-_]", "", str(ws.cell(row, h.get("도면번호(LIST)")).value).upper())
+            val_dwg = re.sub(r"[\s\-_]", "", str(ws.cell(row, h.get("도면번호(DWG)")).value).upper())
+            
+            if val_list != val_dwg:
                 ws.cell(row, h.get("도면번호(LIST)")).fill = 빨간색
                 ws.cell(row, h.get("도면번호(DWG)")).fill = 빨간색
             for s in ["A1", "A3"]:
@@ -379,11 +434,11 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
     print(f"\n[XLSX] 리포트 저장 완료: {out_path}")
 
 # ============================================================================
-# 5. 메인 함수 (질문 2개 축소, 자동 렌더링)
+# 5. 메인 함수 
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_1.1 (LISP Connected - Auto Scale)")
+    print(" AutoDWG Cross-Checker v_1.4 (LISP Connected - Magic Rotation Radar)")
     print("=" * 72)
 
     check_oda_installation()
@@ -406,7 +461,6 @@ def main():
         input("\n엔터를 누르면 종료됩니다...")
         return
 
-    # [핵심] JSON 파일에 저장된 원본 크기를 자동으로 불러옵니다!
     base_w = float(roi_config.get('base_w', 841.0))
     base_h = float(roi_config.get('base_h', 594.0))
 
@@ -426,7 +480,6 @@ def main():
         if os.path.isdir(path_input): dwg_dirs.append(path_input)
 
     print("-" * 72)
-    # 4번, 5번 질문(가로/세로 길이 입력)이 완전히 삭제되었습니다!
 
     if getattr(sys, 'frozen', False): 실행폴더 = os.path.dirname(sys.executable)
     else: 실행폴더 = os.path.dirname(os.path.abspath(__file__))
