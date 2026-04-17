@@ -16,6 +16,7 @@ report.xlsx
 .idea/
 .vscode/
 
+# eeee
 venv/
 __pycache__/
 *.pdf
