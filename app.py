@@ -1,11 +1,9 @@
 """
 app.py  —  DWG 자동 검토기 v_1.1 (LISP 연동형 최종)
 ========================================================================
-[V1.0 주요 업데이트]
-1. 리습(SET_ROI) 연동: %APPDATA%에 저장된 도곽별 좌표 설정을 자동으로 불러옵니다.
-2. 스케일 프리: 1:1 도곽이든 1:100이든 리습에서 딴 비율(%)로 정확히 스캔합니다.
-3. 스마트 힌트: 한글 인코딩 방어 및 설정 파일 누락 시 힌트를 제공합니다.
-4. 원스톱 런: 멈춤 없이 목록표 -> 개별도면 -> 엑셀 출력까지 한 번에 진행됩니다.
+[V1.1 주요 업데이트]
+1. 원본 사이즈 자동 인식: 사용자가 가로/세로 길이를 입력할 필요 없이 LISP이 측정한 값을 자동 적용.
+2. 입력 간소화: 블록명, 목록표 경로, 폴더 경로 딱 3개만 입력하면 자동 실행.
 ========================================================================
 """
 
@@ -30,7 +28,6 @@ ODA_DOWNLOAD_URL = "https://www.opendesign.com/guestfiles/oda_file_converter"
 # 0. 설정 로드 및 엔진 세팅
 # ============================================================================
 def load_roi_config(block_name: str) -> Optional[dict]:
-    """LISP에서 생성한 도곽 설정 파일을 읽어옵니다. (인코딩 방어 추가)"""
     config_dir = os.path.join(os.environ.get('APPDATA', ''), 'AutoDWG_Checker')
     config_path = os.path.join(config_dir, f"{block_name}.json")
     
@@ -279,22 +276,17 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 너비, 높이 = base_w * xscale, base_h * yscale
 
                 def get_txt_in_roi(roi):
-                    # 리습에서 가져온 비율(%)을 실제 좌표로 치환
                     x_min, x_max = ix + (너비 * roi[0]), ix + (너비 * roi[1])
                     y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3])
                     
-                    # 해당 구역 안의 글자들을 모음
                     박스내글자 = [t for t in 모든텍스트 if x_min <= t[0] <= x_max and y_min <= t[1] <= y_max]
-                    # Y축(위에서 아래로), X축(좌에서 우로) 순서로 정렬
                     박스내글자.sort(key=lambda t: (-t[1], t[0]))
                     return " ".join([t[2] for t in 박스내글자])
 
-                # 설정된 ROI 구역별 텍스트 추출
                 t_str = get_txt_in_roi(roi_cfg['title_roi'])
                 n_str = get_txt_in_roi(roi_cfg['num_roi'])
                 s_str = get_txt_in_roi(roi_cfg['scale_roi'])
 
-                # 추출된 문자열 다듬기
                 번호_후보 = _extract_drawing_number(n_str)
                 번호 = _도면번호_세척(번호_후보) if 번호_후보 else ""
                 
@@ -302,7 +294,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 명칭 = re.sub(r"1\s?[/:,]\s?\d{1,4}", "", 명칭, flags=re.IGNORECASE).strip(" ,")
                 
                 a1 = _축척_텍스트_정리(s_str)
-                a3 = "X" # LISP 구역 지정에서는 보통 하나의 축척만 가져오므로 A3는 생략 (혹은 X)
+                a3 = "X"
 
                 if 번호: 
                     데이터.append({
@@ -329,7 +321,6 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], block_name: str, roi_c
     print(f"\n[CAD ] 총 {len(캐드파일들)}개의 도면 분석 중... (터보 모드 가동 🚀)")
     최종_데이터 = []
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        # args에 roi_cfg 추가
         futures = {executor.submit(_process_single_dwg, (path, block_name.strip().lower(), roi_cfg, base_w, base_h)): path for path in 캐드파일들}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             경로 = futures[future]
@@ -388,11 +379,11 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
     print(f"\n[XLSX] 리포트 저장 완료: {out_path}")
 
 # ============================================================================
-# 5. 메인 함수 (끊김 없는 원스톱 진행)
+# 5. 메인 함수 (질문 2개 축소, 자동 렌더링)
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_1.0 (LISP Connected - Full Run)")
+    print(" AutoDWG Cross-Checker v_1.1 (LISP Connected - Auto Scale)")
     print("=" * 72)
 
     check_oda_installation()
@@ -415,7 +406,11 @@ def main():
         input("\n엔터를 누르면 종료됩니다...")
         return
 
-    print(f"\n[성공] '{blk_name}' 설정을 로드했습니다. (LISP 연동 완료)")
+    # [핵심] JSON 파일에 저장된 원본 크기를 자동으로 불러옵니다!
+    base_w = float(roi_config.get('base_w', 841.0))
+    base_h = float(roi_config.get('base_h', 594.0))
+
+    print(f"\n[성공] '{blk_name}' 설정을 로드했습니다. (원본크기: {base_w}x{base_h})")
 
     print("\n2. 도면 목록표 DWG 파일의 경로를 입력하세요.")
     목록표_경로 = input("   경로: ").strip().strip('"')
@@ -431,21 +426,13 @@ def main():
         if os.path.isdir(path_input): dwg_dirs.append(path_input)
 
     print("-" * 72)
-    try:
-        base_w = float(input("4. 해당 도곽 원본의 가로 길이를 입력하세요 (예: 841): ").strip())
-        base_h = float(input("5. 해당 도곽 원본의 세로 길이를 입력하세요 (예: 594): ").strip())
-    except:
-        print("[알림] 기본값(A1: 841x594)으로 진행합니다.")
-        base_w, base_h = 841.0, 594.0
-    print("-" * 72)
+    # 4번, 5번 질문(가로/세로 길이 입력)이 완전히 삭제되었습니다!
 
-    # 실행 파일이 있는 폴더에 엑셀 저장
     if getattr(sys, 'frozen', False): 실행폴더 = os.path.dirname(sys.executable)
     else: 실행폴더 = os.path.dirname(os.path.abspath(__file__))
     최종_저장경로 = os.path.join(실행폴더, 리포트_이름)
 
     try:
-        # 목록표 추출 및 개별 도면 파싱 (roi_config 전달)
         list_데이터 = extract_dwg_list_table(목록표_경로, blk_name, base_w, base_h)
         dwg_데이터 = extract_dwg_data_multiprocess(dwg_dirs, blk_name, roi_config, base_w, base_h)
 
