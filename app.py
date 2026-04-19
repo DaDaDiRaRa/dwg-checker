@@ -1,11 +1,11 @@
 """
-app.py  —  DWG 자동 검토기 v_1.4 (Kunwon Standard Edition)
+app.py  —  DWG 자동 검토기 v_1.5 (LISP 연동형 + 스마트 매칭 + 회전 감지 + 조각 글자 병합)
 ========================================================================
 Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.
 
 본 프로그램은 건원건축의 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 사내 임직원 외 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
-========================================================================
+========================================================================X
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
     return 결과
 
 # ============================================================================
-# 2. 목록표 (DWG) 파싱 로직 (회전 감지 적용)
+# 2. 목록표 (DWG) 파싱 로직
 # ============================================================================
 def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
     texts = []
@@ -225,9 +225,8 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
                 xscale, yscale = abs(float(도곽.dxf.xscale)), abs(float(도곽.dxf.yscale))
                 너비, 높이 = base_w * xscale, base_h * yscale
                 
-                # [회전 레이더] 회전 각도를 가져와서 역회전용 삼각함수 세팅
                 rot_deg = getattr(도곽.dxf, 'rotation', 0.0)
-                rad = math.radians(-rot_deg) # -를 붙여 반대로 돌림
+                rad = math.radians(-rot_deg)
                 cos_val, sin_val = math.cos(rad), math.sin(rad)
 
                 col_ranges = [(ix + (너비 * 0.05758), ix + (너비 * 0.28946)), (ix + (너비 * 0.47970), ix + (너비 * 0.71159))]
@@ -237,17 +236,15 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
                     구역_텍스트 = []
                     for t in 모든텍스트:
                         tx, ty, txt, th = t
-                        # 텍스트 좌표를 삽입점 기준으로 역회전(Un-rotate)시킵니다.
                         dx, dy = tx - ix, ty - iy
                         unrot_x = ix + (dx * cos_val - dy * sin_val)
                         unrot_y = iy + (dx * sin_val + dy * cos_val)
                         
                         if min_x <= unrot_x <= max_x and y_min <= unrot_y <= y_max:
-                            # 정렬을 위해 역회전된 좌표를 저장합니다.
                             구역_텍스트.append((unrot_x, unrot_y, txt, th))
                             
                     if not 구역_텍스트: continue
-                    구역_텍스트.sort(key=lambda x: -x[1]) # Y축 위에서 아래로
+                    구역_텍스트.sort(key=lambda x: -x[1])
                     
                     줄목록, 현재_줄, 현재_y, y_tol = [], [], None, 높이 * 0.012
                     for t in 구역_텍스트:
@@ -267,7 +264,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
     return df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
 
 # ============================================================================
-# 3. 개별 도면 (DWG) 파싱 (LISP ROI + 회전 감지 적용)
+# 3. 개별 도면 (DWG) 파싱 (LISP ROI + 조각 글자 병합 로직)
 # ============================================================================
 def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List[dict], str]:
     전체경로, 목표블록, roi_cfg, base_w, base_h = args
@@ -296,7 +293,6 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 xscale, yscale = abs(float(도곽.dxf.xscale)), abs(float(도곽.dxf.yscale))
                 너비, 높이 = base_w * xscale, base_h * yscale
 
-                # [회전 레이더] 개별 도곽의 회전을 감지하여 역회전 행렬 준비
                 rot_deg = getattr(도곽.dxf, 'rotation', 0.0)
                 rad = math.radians(-rot_deg)
                 cos_val, sin_val = math.cos(rad), math.sin(rad)
@@ -308,18 +304,38 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                     박스내글자 = []
                     for t in 모든텍스트:
                         tx, ty, txt, th = t
-                        # 텍스트 좌표를 삽입점 기준으로 역회전(Un-rotate)시킵니다.
                         dx, dy = tx - ix, ty - iy
                         unrot_x = ix + (dx * cos_val - dy * sin_val)
                         unrot_y = iy + (dx * sin_val + dy * cos_val)
                         
                         if x_min <= unrot_x <= x_max and y_min <= unrot_y <= y_max:
-                            # 정렬을 위해 역회전된 X, Y 위치를 넣습니다.
                             박스내글자.append((unrot_x, unrot_y, txt))
                             
-                    # 역회전된 좌표계에서 Y(위에서 아래), X(좌에서 우)로 정렬
-                    박스내글자.sort(key=lambda t: (-t[1], t[0]))
-                    return " ".join([t[2] for t in 박스내글자])
+                    if not 박스내글자: return ""
+
+                    # [V1.5 핵심] 미세한 Y축 높이 오차를 보정하여 조각난 텍스트를 한 줄로 합칩니다.
+                    박스내글자.sort(key=lambda t: -t[1])
+                    lines = []
+                    current_line = []
+                    current_y = None
+                    y_tol = 높이 * 0.015 # 도곽 높이의 약 1.5% 이내의 오차는 같은 줄로 간주
+
+                    for t in 박스내글자:
+                        if current_y is None or abs(current_y - t[1]) <= y_tol:
+                            current_y = t[1]
+                            current_line.append(t)
+                        else:
+                            # 같은 줄 안에 있는 글자들은 X축(좌->우) 순서로 완벽하게 정렬!
+                            current_line.sort(key=lambda x: x[0]) 
+                            lines.append(" ".join([x[2] for x in current_line]))
+                            current_y = t[1]
+                            current_line = [t]
+                            
+                    if current_line:
+                        current_line.sort(key=lambda x: x[0])
+                        lines.append(" ".join([x[2] for x in current_line]))
+                        
+                    return " ".join(lines)
 
                 t_str = get_txt_in_roi(roi_cfg['title_roi'])
                 n_str = get_txt_in_roi(roi_cfg['num_roi'])
@@ -439,12 +455,14 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_1.4 (LISP Connected - Magic Rotation Radar)")
+    print(" AutoDWG Cross-Checker v_1.5 (Kunwon Standard Edition)")
+    print("=" * 72)
+    print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
 
     check_oda_installation()
 
-    blk_name = input("1. 도곽 블록 이름을 입력하세요: ").strip()
+    blk_name = input("\n1. 도곽 블록 이름을 입력하세요: ").strip()
     roi_config = load_roi_config(blk_name)
 
     if not roi_config:
