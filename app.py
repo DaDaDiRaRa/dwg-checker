@@ -4,15 +4,14 @@ Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights res
 본 프로그램은 건원건축의 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 사내 임직원 외 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
-app.py  —  DWG 자동 검토기 v_3.1 (Kunwon Masterpiece Edition)
+app.py  —  DWG 자동 검토기 v_4.0 (Kunwon Masterpiece - Row Anchor Engine)
 ========================================================================
-[V3.1 주요 업데이트]
-1. 첫 줄 누락 방지 (A1/A3 하이재킹 차단): 머리글의 "A1", "A3" 등을 도면번호로 
-   오인하여 실제 첫 번째 데이터(e.g., BA-201)가 누락되는 치명적 버그를 완벽 해결했습니다.
-2. 도면명 작대기(- -) 클리너: 빈 셀에 채워넣은 하이픈(-)이나 쉼표가 도면명 
-   앞뒤로 붙어서 나오는 현상을 방지하기 위해 특수문자 클리너 로직을 추가했습니다.
-3. 슬라이딩 윈도우 버그 수정: 줄 간격이 좁을 때 표 전체가 한 줄로 인식되는 
-   잠재적 병합 버그를 안전하게 차단했습니다.
+[V4.0 주요 업데이트]
+1. 정규식 철벽 방어(False Positive 차단): "근린생활시설-1"을 "린생활시설-1"이라는 
+   도면번호로 오인하는 치명적 버그를 완벽 차단. (단어의 시작점 규칙 강제 적용)
+2. 로우 앵커(Row-Anchor) 엔진 탑재: 다중행(Multi-line) 도면명이나 Y좌표가 엇갈린 
+   셀 데이터를 완벽하게 묶어내기 위해, 도면번호를 '앵커'로 삼고 주변 텍스트를 
+   종속시키는 스마트 행(Row) 그룹화 알고리즘을 최초 도입했습니다.
 ========================================================================
 """
 
@@ -82,9 +81,25 @@ def check_oda_installation():
 # ============================================================================
 # 1. 공통 유틸리티
 # ============================================================================
-_도면번호_패턴 = re.compile(r"([A-Z\u0391-\u03A9\.가-힣]{1,4})[-_ ]*(\d{1,5}[A-Z]*|TOE)")
+# [V4.0 핵심] Negative Lookbehind(?<!...) 적용: 단어 중간(근'린생활시설'-1)에서 도면번호 낚아채기 방지
+# 꼬리표 번호(예: A5-551.1, A5-551-1) 완벽 대응
+_도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[-_ ]*(\d{1,5}(?:[-.]\d{1,3})?[A-Z]*|TOE)(?!\d|[A-Za-z가-힣])")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?(\d{1,4})|NONE|N/A)", re.I)
 _동_패턴 = re.compile(r"((?:(?:[0-9A-Za-z]+|[가-힣]|[0-9A-Za-z가-힣]+동)\s*[,~&]\s*)*[0-9A-Za-z가-힣]+동)")
+_동_제외단어 = ["인동", "주동", "공동", "자동", "수동", "전동", "연동", "이동", "작동", "부동", "진동", "명동", "구동", "개동", "각동", "해당동", "상동", "하동"]
+
+def _extract_dong_from_title(title: str) -> str:
+    matches = list(_동_패턴.finditer(title))
+    for m in matches:
+        dong_str = m.group(1)
+        is_excluded = False
+        for ex_word in _동_제외단어:
+            if ex_word in dong_str:
+                is_excluded = True
+                break
+        if not is_excluded:
+            return dong_str
+    return ""
 
 def _도면번호_세척(raw_s: str) -> str:
     if not raw_s: return ""
@@ -102,9 +117,7 @@ def _축척_텍스트_정리(txt: str) -> str:
 def _extract_drawing_number(text: str) -> Optional[str]:
     for m in _도면번호_패턴.finditer(text):
         prefix = m.group(1)
-        # [V3.1 패치] "A1", "A3" 등이 도면번호로 둔갑하는 현상 원천 차단!
         if m.group(0) in ["A1", "A3", "A0", "A2", "A4"]: continue
-        
         exclude_words = ["상세", "일람", "배치", "전개", "마감", "계획", "조감", "구조", "코어", "지하", "옥상", "옥탑", "지붕", "주동", "단위", "세대", "내역", "관계", "형별", "부분", "창호", "가구", "조경", "토목", "기계", "전기", "범례", "개요", "표지", "도면"]
         if any(k in prefix for k in exclude_words): continue
         if prefix.endswith("도") or prefix.endswith("표") or prefix.endswith("층") or prefix.endswith("동"): continue
@@ -176,49 +189,37 @@ def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
             seen.add(key); out.append((float(x), float(y), clean, float(h)))
     return out
 
-def _split_lines_from_cell_texts(cell_texts: List[Tuple[float, float, str, float]], row_h: float) -> List[str]:
-    if not cell_texts: return []
-    cell_texts = sorted(cell_texts, key=lambda t: (-t[1], t[0]))
-    y_tol = max(row_h * 0.015, 1.0)
-    lines, current, current_y = [], [], None
-    for x, y, txt, _ in cell_texts:
-        if current_y is None: current_y = y; current.append((x, txt)); continue
-        if abs(current_y - y) <= y_tol: current.append((x, txt))
-        else:
-            current.sort(key=lambda v: v[0]); lines.append(current)
-            current_y = y; current = [(x, txt)]
-    if current: current.sort(key=lambda v: v[0]); lines.append(current)
-    return [" ".join([txt for _, txt in line]) for line in lines]
-
-def _extract_list_scales_from_cell(cell_texts: List[Tuple[float, float, str, float]], row_h: float) -> Tuple[str, str]:
-    if not cell_texts: return "X", "X"
-    label_a1 = [t for t in cell_texts if re.search(r"\bA1\b", t[2].upper())]
-    label_a3 = [t for t in cell_texts if re.search(r"\bA3\b", t[2].upper())]
+def _extract_list_scales_from_cell(cell_texts: List[Tuple[float, float, str, float]], tight_y_tol: float, header_a1_x: Optional[float], header_a3_x: Optional[float]) -> Tuple[str, str]:
     scale_items = []
     for x, y, txt, _ in cell_texts:
         normalized = _축척_텍스트_정리(txt)
         if normalized != "X": scale_items.append((x, y, normalized))
     if not scale_items: return "X", "X"
-    
-    numeric_scales = [(x, y, s) for x, y, s in scale_items if not _is_none_scale(s)]
-    none_scales = [(x, y, s) for x, y, s in scale_items if _is_none_scale(s)]
-    chosen_a1, chosen_a3, used, y_tol = "X", "X", set(), max(row_h * 0.35, 2.0)
 
-    def pick_nearest(label_items, candidates):
-        if not label_items or not candidates: return None
-        label_y = label_items[0][1]
-        ordered = sorted(candidates, key=lambda c: (abs(c[1] - label_y), 1 if _is_none_scale(c[2]) else 0, c[0]))
-        return ordered[0] if abs(ordered[0][1] - label_y) <= y_tol else None
+    a1_val, a3_val = "X", "X"
+    scale_items.sort(key=lambda item: item[0])
 
-    picked = pick_nearest(label_a1, numeric_scales if numeric_scales else scale_items)
-    if picked: chosen_a1 = picked[2]; used.add((picked[0], picked[1], picked[2]))
-    picked = pick_nearest(label_a3, [c for c in (numeric_scales if numeric_scales else scale_items) if (c[0], c[1], c[2]) not in used])
-    if picked: chosen_a3 = picked[2]; used.add((picked[0], picked[1], picked[2]))
-    
-    ordered_values = [s[2] for s in sorted(scale_items, key=lambda v: (-v[1], v[0])) if (s[0], s[1], s[2]) not in used]
-    if chosen_a1 == "X" and ordered_values: chosen_a1 = ordered_values.pop(0)
-    if chosen_a3 == "X" and ordered_values: chosen_a3 = ordered_values.pop(0)
-    return chosen_a1, chosen_a3
+    for x, y, s in scale_items:
+        if header_a1_x is not None and header_a3_x is not None:
+            if abs(x - header_a1_x) <= abs(x - header_a3_x):
+                if a1_val == "X": a1_val = s
+            else:
+                if a3_val == "X": a3_val = s
+        elif header_a3_x is not None:
+            if abs(x - header_a3_x) < tight_y_tol * 20: 
+                if a3_val == "X": a3_val = s
+            else:
+                if a1_val == "X": a1_val = s
+        elif header_a1_x is not None:
+            if abs(x - header_a1_x) < tight_y_tol * 20:
+                if a1_val == "X": a1_val = s
+            else:
+                if a3_val == "X": a3_val = s
+        else:
+            if a1_val == "X": a1_val = s
+            elif a3_val == "X": a3_val = s
+
+    return a1_val, a3_val
 
 def _extract_number_and_title_from_lines(lines: List[str]) -> Tuple[str, str]:
     번호, 명칭후보 = "", []
@@ -235,14 +236,12 @@ def _extract_number_and_title_from_lines(lines: List[str]) -> Tuple[str, str]:
             명칭후보.append(clean)
             
     명칭 = re.sub(r"\s+", " ", " ".join(명칭후보)).strip()
-    
-    # [V3.1 패치] 작대기(- -) 및 쉼표 클리너: 도면명 맨 앞/맨 뒤에 붙은 특수기호를 완벽 삭제합니다.
     명칭 = re.sub(r"^[-_,\s]+|[-_,\s]+$", "", 명칭) 
     
     return 번호, 명칭
 
 # ============================================================================
-# 2. 도면목록표 (DWG) 파싱 로직
+# 2. 도면목록표 (DWG) 파싱 로직 (V4.0 로우-앵커 엔진 탑재)
 # ============================================================================
 def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w: float, base_h: float) -> pd.DataFrame:
     print(f"\n[LIST] DWG 도면목록표 분석 시작: {os.path.basename(dwg_path)}")
@@ -250,8 +249,6 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
     current_dong = "공통" 
 
     list_rois = roi_cfg.get('list_rois', [])
-    
-    # [V3.1 패치] 머리글 투명인간 취급 리스트 부활! 사용자가 박스에 넣어도 걸러냅니다.
     ignore_headers = ["도면번호", "도면명", "축척", "축적", "SCALE", "비고", "사업승인", "착공", "견적", "사용승인", "A1", "A3", "1:1", "도면"]
     
     try:
@@ -285,6 +282,9 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                     
                     roi_w = max_x - min_x
                     
+                    a1_matches = []
+                    a3_matches = []
+                    
                     구역_텍스트 = []
                     for t in 모든텍스트:
                         tx, ty, txt, th = t
@@ -295,39 +295,82 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                         if min_x <= unrot_x <= max_x and y_min <= unrot_y <= y_max:
                             if txt == "-" and th > roi_w * 0.8: continue
                             
-                            # [V3.1 패치] 머리글은 아예 텍스트 수집 과정에서 빼버립니다!
                             clean_t = txt.replace(" ", "").replace("\n", "").strip()
+                            
+                            if not _extract_drawing_number(txt):
+                                if re.search(r"\bA1\b", txt.upper()): a1_matches.append((unrot_x, unrot_y))
+                                if re.search(r"\bA3\b", txt.upper()): a3_matches.append((unrot_x, unrot_y))
+                            
                             if any(ih == clean_t for ih in ignore_headers): 
                                 continue
                                 
                             구역_텍스트.append((unrot_x, unrot_y, txt, th))
+                    
+                    header_a1_x, header_a3_x = None, None
+                    if a1_matches:
+                        a1_matches.sort(key=lambda v: -v[1]) 
+                        header_a1_x = a1_matches[0][0]
+                    if a3_matches:
+                        a3_matches.sort(key=lambda v: -v[1])
+                        header_a3_x = a3_matches[0][0]
                             
                     if not 구역_텍스트: continue
-                    구역_텍스트.sort(key=lambda x: -x[1]) 
                     
-                    줄목록, 현재_줄, 현재_y, y_tol = [], [], None, 높이 * 0.012
-                    
-                    # [V3.1 패치] 안전한 줄 묶기(Sliding Window 방지)
+                    # [V4.0 핵심 엔진] 로우 앵커(Row Anchor) 그룹화 알고리즘
+                    # 1. 텍스트들을 아주 미세한 Y축 선상(Sub-lines)으로 1차 결합
+                    tight_y_tol = 높이 * 0.005 # 매우 좁은 Y 허용오차
+                    구역_텍스트.sort(key=lambda x: -x[1]) # 위에서 아래로
+                    sub_lines = []
+                    curr_sub = []
+                    curr_y = None
                     for t in 구역_텍스트:
-                        if 현재_y is None: 
-                            현재_y = t[1]
-                            현재_줄.append(t)
-                        elif abs(현재_y - t[1]) <= y_tol: 
-                            현재_줄.append(t)
-                        else: 
-                            줄목록.append(현재_줄)
-                            현재_y = t[1]
-                            현재_줄 = [t]
-                    if 현재_줄: 줄목록.append(현재_줄)
-                    
-                    for row_texts in 줄목록:
-                        lines = _split_lines_from_cell_texts(row_texts, y_tol * 2)
-                        번호, 명칭 = _extract_number_and_title_from_lines(lines)
+                        if curr_y is None or abs(curr_y - t[1]) <= tight_y_tol:
+                            curr_y = t[1]
+                            curr_sub.append(t)
+                        else:
+                            curr_sub.sort(key=lambda x: x[0]) # X축 정렬
+                            sub_lines.append({'y': curr_y, 'texts': curr_sub})
+                            curr_y = t[1]
+                            curr_sub = [t]
+                    if curr_sub:
+                        curr_sub.sort(key=lambda x: x[0])
+                        sub_lines.append({'y': curr_y, 'texts': curr_sub})
+
+                    # 2. 도면번호를 앵커(Anchor)로 삼아 진짜 '행(Row)' 객체 만들기
+                    rows = []
+                    unassigned_sub_lines = []
+                    for sub in sub_lines:
+                        joined_text = " ".join([t[2] for t in sub['texts']])
+                        drw_no = _extract_drawing_number(joined_text)
+                        if drw_no:
+                            rows.append({'anchor_y': sub['y'], 'sub_lines': [sub], 'drw_no': drw_no})
+                        else:
+                            unassigned_sub_lines.append(sub)
+
+                    # 3. 도면번호가 없는 텍스트(다중행 도면명 등)를 가장 가까운 앵커 행에 편입
+                    for sub in unassigned_sub_lines:
+                        if not rows: continue
+                        closest_row = min(rows, key=lambda r: abs(r['anchor_y'] - sub['y']))
+                        # 도곽 높이의 4% 이내에 있는 글자만 종속시킴 (오류 방지)
+                        if abs(closest_row['anchor_y'] - sub['y']) < 높이 * 0.04:
+                            closest_row['sub_lines'].append(sub)
+
+                    # 4. 완성된 '행(Row)' 별로 완벽하게 데이터 추출
+                    for row in rows:
+                        row['sub_lines'].sort(key=lambda s: -s['y']) # 행 내부에서 다시 위에서 아래로 정렬
+                        
+                        lines_str = []
+                        all_texts = []
+                        for sub in row['sub_lines']:
+                            lines_str.append(" ".join([t[2] for t in sub['texts']]))
+                            all_texts.extend(sub['texts'])
+                            
+                        번호, 명칭 = _extract_number_and_title_from_lines(lines_str)
                         if not 번호: continue
                         
-                        동_매치 = _동_패턴.search(명칭)
-                        if 동_매치:
-                            current_dong = 동_매치.group(1)
+                        extracted_dong = _extract_dong_from_title(명칭)
+                        if extracted_dong:
+                            current_dong = extracted_dong
 
                         if current_dong != "공통":
                             임시_명칭 = 명칭.replace(current_dong, "")
@@ -335,7 +378,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                             if 임시_명칭:
                                 명칭 = 임시_명칭
 
-                        a1, a3 = _extract_list_scales_from_cell(row_texts, y_tol * 2)
+                        a1, a3 = _extract_list_scales_from_cell(all_texts, tight_y_tol, header_a1_x, header_a3_x)
                         
                         데이터.append({
                             "도면번호(LIST)": 번호, 
@@ -437,10 +480,8 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 if 번호_후보:
                     명칭 = 명칭.replace(번호_후보, "")
 
-                동_매치_dwg = _동_패턴.search(명칭)
-                dwg_dong = ""
-                if 동_매치_dwg:
-                    dwg_dong = 동_매치_dwg.group(1)
+                dwg_dong = _extract_dong_from_title(명칭)
+                if dwg_dong:
                     임시_명칭 = 명칭.replace(dwg_dong, "")
                     임시_명칭 = re.sub(r"^[,\s]+|[,\s]+$", "", 임시_명칭).strip()
                     if 임시_명칭:
@@ -450,20 +491,30 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 명칭 = re.sub(r"1\s?[/:,]\s?\d{1,4}", "", 명칭, flags=re.IGNORECASE).strip(" ,")
                 
                 명칭 = re.sub(r"\s+", " ", 명칭)
-                명칭 = re.sub(r"^[-_,\s]+|[-_,\s]+$", "", 명칭)  # [V3.1 패치] 개별 도면에서도 특수문자 청소
+                명칭 = re.sub(r"^[-_,\s]+|[-_,\s]+$", "", 명칭)
 
                 matches = list(_축척_패턴.finditer(s_str.upper()))
                 a1, a3 = "X", "X"
                 
-                if matches:
+                if len(matches) == 1:
                     val1 = matches[0].group(2)
+                    scale_val = f"1/{val1}" if val1 else "NONE"
+                    if "A3" in s_str.upper() and "A1" not in s_str.upper():
+                        a3 = scale_val
+                    elif "A1" in s_str.upper() and "A3" not in s_str.upper():
+                        a1 = scale_val
+                    else:
+                        a1 = scale_val
+                elif len(matches) >= 2:
+                    val1 = matches[0].group(2)
+                    val2 = matches[1].group(2)
                     a1 = f"1/{val1}" if val1 else "NONE"
-                    if len(matches) >= 2:
-                        val2 = matches[1].group(2)
-                        a3 = f"1/{val2}" if val2 else "NONE"
-                
-                if a1 == "X" and ("NONE" in s_str.upper() or "N/A" in s_str.upper()):
-                    a1, a3 = "NONE", "NONE"
+                    a3 = f"1/{val2}" if val2 else "NONE"
+                elif "NONE" in s_str.upper() or "N/A" in s_str.upper():
+                    if "A3" in s_str.upper() and "A1" not in s_str.upper():
+                        a3 = "NONE"
+                    else:
+                        a1 = "NONE"
 
                 if 번호: 
                     데이터.append({
@@ -607,7 +658,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_3.1 (Kunwon Masterpiece Edition)")
+    print(" AutoDWG Cross-Checker v_4.0 (Kunwon Masterpiece Edition)")
     print("=" * 72)
     print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
