@@ -4,12 +4,15 @@ Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights res
 본 프로그램은 건원건축의 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 사내 임직원 외 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
-app.py  —  DWG 자동 검토기 v_3.0 (Kunwon Masterpiece Edition)
+app.py  —  DWG 자동 검토기 v_3.1 (Kunwon Masterpiece Edition)
 ========================================================================
-[V3.0 주요 업데이트]
-1. 목록표 다중 단(Column) 사용자 지정 맵핑: 하드코딩된 단 나누기를 완전히 폐기하고,
-   리습에서 사용자가 직접 지정한 N개의 데이터 구역을 순회하며 추출합니다. 
-   (1단~N단 표 모두 완벽 대응, 머리글 간섭 완벽 차단)
+[V3.1 주요 업데이트]
+1. 첫 줄 누락 방지 (A1/A3 하이재킹 차단): 머리글의 "A1", "A3" 등을 도면번호로 
+   오인하여 실제 첫 번째 데이터(e.g., BA-201)가 누락되는 치명적 버그를 완벽 해결했습니다.
+2. 도면명 작대기(- -) 클리너: 빈 셀에 채워넣은 하이픈(-)이나 쉼표가 도면명 
+   앞뒤로 붙어서 나오는 현상을 방지하기 위해 특수문자 클리너 로직을 추가했습니다.
+3. 슬라이딩 윈도우 버그 수정: 줄 간격이 좁을 때 표 전체가 한 줄로 인식되는 
+   잠재적 병합 버그를 안전하게 차단했습니다.
 ========================================================================
 """
 
@@ -99,6 +102,9 @@ def _축척_텍스트_정리(txt: str) -> str:
 def _extract_drawing_number(text: str) -> Optional[str]:
     for m in _도면번호_패턴.finditer(text):
         prefix = m.group(1)
+        # [V3.1 패치] "A1", "A3" 등이 도면번호로 둔갑하는 현상 원천 차단!
+        if m.group(0) in ["A1", "A3", "A0", "A2", "A4"]: continue
+        
         exclude_words = ["상세", "일람", "배치", "전개", "마감", "계획", "조감", "구조", "코어", "지하", "옥상", "옥탑", "지붕", "주동", "단위", "세대", "내역", "관계", "형별", "부분", "창호", "가구", "조경", "토목", "기계", "전기", "범례", "개요", "표지", "도면"]
         if any(k in prefix for k in exclude_words): continue
         if prefix.endswith("도") or prefix.endswith("표") or prefix.endswith("층") or prefix.endswith("동"): continue
@@ -225,12 +231,18 @@ def _extract_number_and_title_from_lines(lines: List[str]) -> Tuple[str, str]:
             clean = clean.replace(raw_no, " ")
         clean = re.sub(r"\bA1\b|\bA3\b|NONE|N/A|1\s?[/:,]\s?\d{1,4}", " ", clean, flags=re.I)
         clean = re.sub(r"\s+", " ", clean).strip(" ,")
-        if len(clean) > 1 and not any(bw in clean.upper() for bw in ["도면명", "SCALE", "SUBJECT", "TITLE", "축 척", "축척"]): 명칭후보.append(clean)
+        if len(clean) > 1 and not any(bw in clean.upper() for bw in ["도면명", "SCALE", "SUBJECT", "TITLE", "축 척", "축척"]): 
+            명칭후보.append(clean)
+            
     명칭 = re.sub(r"\s+", " ", " ".join(명칭후보)).strip()
+    
+    # [V3.1 패치] 작대기(- -) 및 쉼표 클리너: 도면명 맨 앞/맨 뒤에 붙은 특수기호를 완벽 삭제합니다.
+    명칭 = re.sub(r"^[-_,\s]+|[-_,\s]+$", "", 명칭) 
+    
     return 번호, 명칭
 
 # ============================================================================
-# [V3.0 핵심] 도면목록표 (DWG) 파싱 로직 (리습의 다중 단 설정 완벽 적용)
+# 2. 도면목록표 (DWG) 파싱 로직
 # ============================================================================
 def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w: float, base_h: float) -> pd.DataFrame:
     print(f"\n[LIST] DWG 도면목록표 분석 시작: {os.path.basename(dwg_path)}")
@@ -238,6 +250,9 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
     current_dong = "공통" 
 
     list_rois = roi_cfg.get('list_rois', [])
+    
+    # [V3.1 패치] 머리글 투명인간 취급 리스트 부활! 사용자가 박스에 넣어도 걸러냅니다.
+    ignore_headers = ["도면번호", "도면명", "축척", "축적", "SCALE", "비고", "사업승인", "착공", "견적", "사용승인", "A1", "A3", "1:1", "도면"]
     
     try:
         doc = _cad_로드(Path(dwg_path))
@@ -254,18 +269,15 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                 rad = math.radians(-rot_deg)
                 cos_val, sin_val = math.cos(rad), math.sin(rad)
 
-                # 사용자가 리습에서 지정한 다중 단(1단~N단) 구역을 적용합니다.
                 if list_rois and len(list_rois) > 0:
                     target_ranges = list_rois
                 else:
-                    # [호환성 플랜 B] 옛날 버전 JSON일 경우 기존 2단 하드코딩 비율 사용
                     target_ranges = [
                         [0.05758, 0.28946, 0.05235, 0.97500],
                         [0.47970, 0.71159, 0.05235, 0.97500]
                     ]
                 
                 for roi in target_ranges:
-                    # 리습에서 가져온 비율을 실제 좌표로 치환
                     min_x = ix + (너비 * roi[0])
                     max_x = ix + (너비 * roi[1])
                     y_min = iy + (높이 * roi[2])
@@ -280,18 +292,32 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                         unrot_x = ix + (dx * cos_val - dy * sin_val)
                         unrot_y = iy + (dx * sin_val + dy * cos_val)
                         
-                        # 사용자가 직접 드래그한 데이터 박스 안에 들어오는 놈들만 쏙쏙 뺍니다!
                         if min_x <= unrot_x <= max_x and y_min <= unrot_y <= y_max:
-                            if txt == "-" and th > roi_w * 0.8: continue  # 박스 테두리선 무시
+                            if txt == "-" and th > roi_w * 0.8: continue
+                            
+                            # [V3.1 패치] 머리글은 아예 텍스트 수집 과정에서 빼버립니다!
+                            clean_t = txt.replace(" ", "").replace("\n", "").strip()
+                            if any(ih == clean_t for ih in ignore_headers): 
+                                continue
+                                
                             구역_텍스트.append((unrot_x, unrot_y, txt, th))
                             
                     if not 구역_텍스트: continue
-                    구역_텍스트.sort(key=lambda x: -x[1]) # 위에서 아래로 정렬
+                    구역_텍스트.sort(key=lambda x: -x[1]) 
                     
                     줄목록, 현재_줄, 현재_y, y_tol = [], [], None, 높이 * 0.012
+                    
+                    # [V3.1 패치] 안전한 줄 묶기(Sliding Window 방지)
                     for t in 구역_텍스트:
-                        if 현재_y is None or abs(현재_y - t[1]) <= y_tol: 현재_y = t[1]; 현재_줄.append(t)
-                        else: 줄목록.append(현재_줄); 현재_y = t[1]; 현재_줄 = [t]
+                        if 현재_y is None: 
+                            현재_y = t[1]
+                            현재_줄.append(t)
+                        elif abs(현재_y - t[1]) <= y_tol: 
+                            현재_줄.append(t)
+                        else: 
+                            줄목록.append(현재_줄)
+                            현재_y = t[1]
+                            현재_줄 = [t]
                     if 현재_줄: 줄목록.append(현재_줄)
                     
                     for row_texts in 줄목록:
@@ -383,8 +409,10 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                     y_tol = 높이 * 0.015
 
                     for t in 박스내글자:
-                        if current_y is None or abs(current_y - t[1]) <= y_tol:
+                        if current_y is None:
                             current_y = t[1]
+                            current_line.append(t)
+                        elif abs(current_y - t[1]) <= y_tol:
                             current_line.append(t)
                         else:
                             current_line.sort(key=lambda x: x[0]) 
@@ -420,8 +448,10 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                     
                 명칭 = re.sub(r"\bA1\b|\bA3\b|NONE|N/A", "", 명칭, flags=re.IGNORECASE)
                 명칭 = re.sub(r"1\s?[/:,]\s?\d{1,4}", "", 명칭, flags=re.IGNORECASE).strip(" ,")
-                명칭 = re.sub(r"\s+", " ", 명칭)
                 
+                명칭 = re.sub(r"\s+", " ", 명칭)
+                명칭 = re.sub(r"^[-_,\s]+|[-_,\s]+$", "", 명칭)  # [V3.1 패치] 개별 도면에서도 특수문자 청소
+
                 matches = list(_축척_패턴.finditer(s_str.upper()))
                 a1, a3 = "X", "X"
                 
@@ -577,7 +607,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_3.0 (Kunwon Masterpiece Edition)")
+    print(" AutoDWG Cross-Checker v_3.1 (Kunwon Masterpiece Edition)")
     print("=" * 72)
     print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
@@ -627,7 +657,6 @@ def main():
     최종_저장경로 = os.path.join(실행폴더, 리포트_이름)
 
     try:
-        # [V3.0 패치] roi_config를 통째로 넘겨 다중 단 정보를 함수 내부에서 처리하게 함
         list_데이터 = extract_dwg_list_table(목록표_경로, blk_name, roi_config, base_w, base_h)
         dwg_데이터 = extract_dwg_data_multiprocess(dwg_dirs, blk_name, roi_config, base_w, base_h)
 
