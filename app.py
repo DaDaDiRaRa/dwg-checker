@@ -4,11 +4,12 @@ Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights res
 본 프로그램은 건원건축의 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 사내 임직원 외 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
-app.py  —  DWG 자동 검토기 v_2.1 (Kunwon Standard Edition)
+app.py  —  DWG 자동 검토기 v_2.2 (Kunwon Standard Edition)
 ========================================================================
-[V2.1 주요 업데이트]
-1. 다중 동(Multi-Building) 완벽 감지: "102, 103동" 이나 "101~103동" 처럼 
-   여러 동이 묶여있는 텍스트를 하나의 그룹으로 완벽하게 인식하고 추출합니다.
+[V2.2 주요 업데이트]
+1. 전 항목 크로스체크(Cross-Check) 강화: 기존의 축척, 도면번호 외에 '도면명' 항목도 
+   목록표와 개별 도면을 비교하여 다를 경우 빨간색으로 경고(Fill)합니다. 
+   (단순 띄어쓰기 오차는 무시하고 알맹이 텍스트만 비교합니다.)
 ========================================================================
 """
 
@@ -80,8 +81,6 @@ def check_oda_installation():
 # ============================================================================
 _도면번호_패턴 = re.compile(r"([A-Z\u0391-\u03A9\.가-힣]{1,4})[-_ ]*(\d{1,5}[A-Z]*|TOE)")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?(\d{1,4})|NONE|N/A)", re.I)
-
-# [V2.1 핵심] 102, 103동 / 101~105동 / A, B동 등을 모두 하나로 묶어서 잡아내는 초정밀 레이더
 _동_패턴 = re.compile(r"((?:(?:[0-9A-Za-z]+|[가-힣]|[0-9A-Za-z가-힣]+동)\s*[,~&]\s*)*[0-9A-Za-z가-힣]+동)")
 
 def _도면번호_세척(raw_s: str) -> str:
@@ -456,7 +455,7 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], block_name: str, roi_c
     return pd.DataFrame(최종_데이터)
 
 # ============================================================================
-# 4. 리포트 생성
+# 4. 리포트 생성 (모든 항목 크로스체크 및 하이라이트)
 # ============================================================================
 def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
     if list_df.empty and dwg_df.empty:
@@ -505,17 +504,28 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
         if ws.cell(row, h["상태"]).value != "일치":
             for c in range(1, len(cols)+1): ws.cell(row, c).fill = 빨간색
         else:
+            # 1. 도면번호 비교 (띄어쓰기, 하이픈 무시)
             val_list = re.sub(r"[\s\-_]", "", str(ws.cell(row, h.get("도면번호(LIST)")).value).upper())
             val_dwg = re.sub(r"[\s\-_]", "", str(ws.cell(row, h.get("도면번호(DWG)")).value).upper())
-            
             if val_list != val_dwg:
                 ws.cell(row, h.get("도면번호(LIST)")).fill = 빨간색
                 ws.cell(row, h.get("도면번호(DWG)")).fill = 빨간색
+                
+            # 2. 도면명 비교 (단순 띄어쓰기 차이는 무시하고 텍스트만 비교)
+            name_list = re.sub(r"\s+", "", str(ws.cell(row, h.get("도면명(LIST)")).value))
+            name_dwg = re.sub(r"\s+", "", str(ws.cell(row, h.get("도면명(DWG)")).value))
+            if name_list != name_dwg:
+                ws.cell(row, h.get("도면명(LIST)")).fill = 빨간색
+                ws.cell(row, h.get("도면명(DWG)")).fill = 빨간색
+
+            # 3. 축척 비교
             for s in ["A1", "A3"]:
                 p_v = str(ws.cell(row, h[f"축척_{s}(LIST)"]).value).replace(" ","")
                 d_v = str(ws.cell(row, h[f"축척_{s}(DWG)"]).value).replace(" ","")
                 if p_v != d_v:
-                    ws.cell(row, h[f"축척_{s}(LIST)"]).fill = 빨간색; ws.cell(row, h[f"축척_{s}(DWG)"]).fill = 빨간색
+                    ws.cell(row, h[f"축척_{s}(LIST)"]).fill = 빨간색
+                    ws.cell(row, h[f"축척_{s}(DWG)"]).fill = 빨간색
+
     wb.save(out_path)
     print(f"\n[XLSX] 리포트 저장 완료: {out_path}")
 
@@ -524,7 +534,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_2.1 (Kunwon Standard Edition)")
+    print(" AutoDWG Cross-Checker v_2.2 (Kunwon Standard Edition)")
     print("=" * 72)
     print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
