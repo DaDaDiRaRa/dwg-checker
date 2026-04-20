@@ -1,11 +1,15 @@
 """
-app.py  —  DWG 자동 검토기 v_1.5 (LISP 연동형 + 스마트 매칭 + 회전 감지 + 조각 글자 병합)
-========================================================================
 Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.
 
 본 프로그램은 건원건축의 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 사내 임직원 외 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
-========================================================================X
+
+app.py  —  DWG 자동 검토기 v_2.1 (Kunwon Standard Edition)
+========================================================================
+[V2.1 주요 업데이트]
+1. 다중 동(Multi-Building) 완벽 감지: "102, 103동" 이나 "101~103동" 처럼 
+   여러 동이 묶여있는 텍스트를 하나의 그룹으로 완벽하게 인식하고 추출합니다.
+========================================================================
 """
 
 from __future__ import annotations
@@ -77,6 +81,9 @@ def check_oda_installation():
 _도면번호_패턴 = re.compile(r"([A-Z\u0391-\u03A9\.가-힣]{1,4})[-_ ]*(\d{1,5}[A-Z]*|TOE)")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?(\d{1,4})|NONE|N/A)", re.I)
 
+# [V2.1 핵심] 102, 103동 / 101~105동 / A, B동 등을 모두 하나로 묶어서 잡아내는 초정밀 레이더
+_동_패턴 = re.compile(r"((?:(?:[0-9A-Za-z]+|[가-힣]|[0-9A-Za-z가-힣]+동)\s*[,~&]\s*)*[0-9A-Za-z가-힣]+동)")
+
 def _도면번호_세척(raw_s: str) -> str:
     if not raw_s: return ""
     s = raw_s.strip().upper().replace("Λ", "A").replace("Δ", "A").replace("TOE", "108")
@@ -131,6 +138,20 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
             h = getattr(ent.dxf, "height", 10.0)
             txt = (ent.dxf.text or "").strip()
             if txt: 결과.append((float(p[0]), float(p[1]), txt, float(h)))
+        elif 유형 == "LINE":
+            s, e = ent.dxf.start, ent.dxf.end
+            dx, dy = abs(s.x - e.x), abs(s.y - e.y)
+            if dx > 0 and dy / dx < 0.2:
+                mx, my = (s.x + e.x) / 2, (s.y + e.y) / 2
+                결과.append((float(mx), float(my), "-", float(dx)))
+        elif 유형 == "LWPOLYLINE":
+            pts = ent.get_points('xy')
+            if len(pts) == 2:
+                s, e = pts[0], pts[1]
+                dx, dy = abs(s[0] - e[0]), abs(s[1] - e[1])
+                if dx > 0 and dy / dx < 0.2:
+                    mx, my = (s[0] + e[0]) / 2, (s[1] + e[1]) / 2
+                    결과.append((float(mx), float(my), "-", float(dx)))
     except Exception: pass
     return 결과
 
@@ -140,7 +161,7 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
 def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
     texts = []
     try:
-        for ent in layout.query("TEXT MTEXT"): texts.extend(_텍스트_데이터_추출(ent))
+        for ent in layout.query("TEXT MTEXT LINE LWPOLYLINE"): texts.extend(_텍스트_데이터_추출(ent))
         for ins in layout.query("INSERT"):
             for att in getattr(ins, "attribs", []): texts.extend(_텍스트_데이터_추출(att))
     except Exception: pass
@@ -214,6 +235,8 @@ def _extract_number_and_title_from_lines(lines: List[str]) -> Tuple[str, str]:
 def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h: float) -> pd.DataFrame:
     print(f"\n[LIST] DWG 도면목록표 분석 시작: {os.path.basename(dwg_path)}")
     데이터, 목표블록 = [], block_name.strip().lower()
+    current_dong = "공통" 
+
     try:
         doc = _cad_로드(Path(dwg_path))
         for layout in doc.layouts:
@@ -233,6 +256,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
                 y_min, y_max = iy + (높이 * 0.05235), iy + (높이 * 0.92600)
                 
                 for min_x, max_x in col_ranges:
+                    roi_w = max_x - min_x
                     구역_텍스트 = []
                     for t in 모든텍스트:
                         tx, ty, txt, th = t
@@ -241,6 +265,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
                         unrot_y = iy + (dx * sin_val + dy * cos_val)
                         
                         if min_x <= unrot_x <= max_x and y_min <= unrot_y <= y_max:
+                            if txt == "-" and th > roi_w * 0.8: continue
                             구역_텍스트.append((unrot_x, unrot_y, txt, th))
                             
                     if not 구역_텍스트: continue
@@ -251,20 +276,39 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, base_w: float, base_h
                         if 현재_y is None or abs(현재_y - t[1]) <= y_tol: 현재_y = t[1]; 현재_줄.append(t)
                         else: 줄목록.append(현재_줄); 현재_y = t[1]; 현재_줄 = [t]
                     if 현재_줄: 줄목록.append(현재_줄)
+                    
                     for row_texts in 줄목록:
                         lines = _split_lines_from_cell_texts(row_texts, y_tol * 2)
                         번호, 명칭 = _extract_number_and_title_from_lines(lines)
                         if not 번호: continue
+                        
+                        동_매치 = _동_패턴.search(명칭)
+                        if 동_매치:
+                            current_dong = 동_매치.group(1)
+
+                        if current_dong != "공통":
+                            임시_명칭 = 명칭.replace(current_dong, "")
+                            임시_명칭 = re.sub(r"^[,\s]+|[,\s]+$", "", 임시_명칭).strip()
+                            if 임시_명칭:
+                                명칭 = 임시_명칭
+
                         a1, a3 = _extract_list_scales_from_cell(row_texts, y_tol * 2)
-                        데이터.append({"도면번호(LIST)": 번호, "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
+                        
+                        데이터.append({
+                            "도면번호(LIST)": 번호, 
+                            "구분(동)": current_dong, 
+                            "도면명(LIST)": 명칭, 
+                            "축척_A1(LIST)": a1, 
+                            "축척_A3(LIST)": a3
+                        })
     except Exception as e: print(f"[ERROR] 목록표 분석 중 오류: {e}")
     
     df = pd.DataFrame(데이터)
-    if df.empty: return pd.DataFrame(columns=["도면번호(LIST)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"])
+    if df.empty: return pd.DataFrame(columns=["도면번호(LIST)", "구분(동)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"])
     return df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
 
 # ============================================================================
-# 3. 개별 도면 (DWG) 파싱 (LISP ROI + 조각 글자 병합 로직)
+# 3. 개별 도면 (DWG) 파싱
 # ============================================================================
 def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List[dict], str]:
     전체경로, 목표블록, roi_cfg, base_w, base_h = args
@@ -279,7 +323,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
             
             도곽_발견됨 = True
             모든텍스트_raw = []
-            for ent in layout.query("TEXT MTEXT"): 모든텍스트_raw.extend(_텍스트_데이터_추출(ent))
+            for ent in layout.query("TEXT MTEXT LINE LWPOLYLINE"): 모든텍스트_raw.extend(_텍스트_데이터_추출(ent))
             for ins in layout.query("INSERT"):
                 for att in getattr(ins, "attribs", []): 모든텍스트_raw.extend(_텍스트_데이터_추출(att))
             
@@ -300,6 +344,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 def get_txt_in_roi(roi):
                     x_min, x_max = ix + (너비 * roi[0]), ix + (너비 * roi[1])
                     y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3])
+                    roi_w = x_max - x_min
                     
                     박스내글자 = []
                     for t in 모든텍스트:
@@ -309,23 +354,22 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                         unrot_y = iy + (dx * sin_val + dy * cos_val)
                         
                         if x_min <= unrot_x <= x_max and y_min <= unrot_y <= y_max:
+                            if txt == "-" and th > roi_w * 0.8: continue
                             박스내글자.append((unrot_x, unrot_y, txt))
                             
                     if not 박스내글자: return ""
 
-                    # [V1.5 핵심] 미세한 Y축 높이 오차를 보정하여 조각난 텍스트를 한 줄로 합칩니다.
                     박스내글자.sort(key=lambda t: -t[1])
                     lines = []
                     current_line = []
                     current_y = None
-                    y_tol = 높이 * 0.015 # 도곽 높이의 약 1.5% 이내의 오차는 같은 줄로 간주
+                    y_tol = 높이 * 0.015
 
                     for t in 박스내글자:
                         if current_y is None or abs(current_y - t[1]) <= y_tol:
                             current_y = t[1]
                             current_line.append(t)
                         else:
-                            # 같은 줄 안에 있는 글자들은 X축(좌->우) 순서로 완벽하게 정렬!
                             current_line.sort(key=lambda x: x[0]) 
                             lines.append(" ".join([x[2] for x in current_line]))
                             current_y = t[1]
@@ -347,6 +391,13 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 명칭 = t_str
                 if 번호_후보:
                     명칭 = 명칭.replace(번호_후보, "")
+
+                동_매치_dwg = _동_패턴.search(명칭)
+                if 동_매치_dwg:
+                    임시_명칭 = 명칭.replace(동_매치_dwg.group(1), "")
+                    임시_명칭 = re.sub(r"^[,\s]+|[,\s]+$", "", 임시_명칭).strip()
+                    if 임시_명칭:
+                        명칭 = 임시_명칭
                     
                 명칭 = re.sub(r"\bA1\b|\bA3\b|NONE|N/A", "", 명칭, flags=re.IGNORECASE)
                 명칭 = re.sub(r"1\s?[/:,]\s?\d{1,4}", "", 명칭, flags=re.IGNORECASE).strip(" ,")
@@ -423,7 +474,24 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
     결과 = pd.merge(lst, dwg, on="KEY", how="outer", indicator=True)
     결과["상태"] = 결과["_merge"].map({"both": "일치", "left_only": "DWG 누락", "right_only": "목록표 누락"})
     
-    cols = ["도면번호(LIST)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)", "도면번호(DWG)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
+    if "구분(동)" not in 결과.columns:
+        결과["구분(동)"] = ""
+
+    prev_dong = ""
+    dong_col_idx = 결과.columns.get_loc("구분(동)")
+    for i in range(len(결과)):
+        curr_dong = str(결과.iat[i, dong_col_idx]).strip()
+        if curr_dong == "nan" or not curr_dong:
+            prev_dong = ""
+            결과.iat[i, dong_col_idx] = ""
+            continue
+        
+        if curr_dong == prev_dong:
+            결과.iat[i, dong_col_idx] = ""  
+        else:
+            prev_dong = curr_dong          
+
+    cols = ["도면번호(LIST)", "구분(동)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)", "도면번호(DWG)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
     for c in cols: 
         if c not in 결과.columns: 결과[c] = ""
     
@@ -432,6 +500,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
     wb = load_workbook(out_path); ws = wb.active
     빨간색 = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
     h = {cell.value: cell.column for cell in ws[1]}
+    
     for row in range(2, ws.max_row + 1):
         if ws.cell(row, h["상태"]).value != "일치":
             for c in range(1, len(cols)+1): ws.cell(row, c).fill = 빨간색
@@ -455,7 +524,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_1.5 (Kunwon Standard Edition)")
+    print(" AutoDWG Cross-Checker v_2.1 (Kunwon Standard Edition)")
     print("=" * 72)
     print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
