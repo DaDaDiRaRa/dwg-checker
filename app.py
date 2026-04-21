@@ -793,9 +793,9 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_6.23 (Kunwon Masterpiece - Sheet Prefix Fix)")
+    print(" AutoDWG Cross-Checker v_6.23")
     print("=" * 72)
-    print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
+    print(" Copyright (c) 2026 건원건축 김정현. All rights reserved.")
     print("=" * 72)
 
     check_oda_installation()
