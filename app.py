@@ -4,16 +4,14 @@ Copyright (c) 2026 건원건축 김정현. All rights reserved.
 본 프로그램은 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
-app.py  —  DWG 자동 검토기 v_6.14 (Kunwon Masterpiece - Ultimate Evolution)
+app.py  —  DWG 자동 검토기 v_6.23 (Kunwon Masterpiece - Sheet Prefix Fix)
 ========================================================================
-[V6.14 주요 업데이트]
-1. X-Ray XREF Vision (투명 도장 기술): 외부참조(XREF) 원본 도곽 DWG를 사전 스캔하여, 
-   파이썬이 인식하지 못하던 원본 내부의 하이픈(-)과 A1, A3 텍스트를 
-   개별 도면 및 목록표 분석 시 실제 도면 위에 수학적으로 완벽하게 오버레이(합성)합니다.
-2. 더블 하이픈 압축: 하이픈 자석 기능으로 인해 발생하던 "A0--006" 등의 
-   중복 기호 오류를 단일 하이픈("A0-006")으로 정제하는 압축 필터를 추가했습니다.
-3. 지우개 명단 확장: 도면명에 "SUBJECT", "SUBJECT TITLE", "PROJECT TITLE" 등이 
-   남아있는 현상을 해결하기 위해 글로벌 지우개 명단에 해당 단어들을 추가했습니다.
+[V6.23 주요 업데이트]
+1. 기호 납치(Prefix Hijacking) 방지: 도면번호 주변에 있는 "SHEET NO." 또는 "SHEET" 
+   단어가 알파벳 기호로 오인되어 "SHEET-112"와 같이 잘못 추출되는 현상을 방지하기 위해, 
+   글로벌 지우개 명단에 해당 단어들을 추가했습니다. 이제 방해 요소가 사전에 제거되어 
+   "AG - 112" 등 실제 도면 기호만 정확하게 낚아챕니다.
+2. 기존 V6.22 로직(ATTDEF 태그 우선순위, 투 트랙 분기 등) 완벽 유지.
 ========================================================================
 """
 
@@ -86,16 +84,17 @@ def check_oda_installation():
 _도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[-.~–—−]\d{1,3})?[A-Z]*|TOE)(?!\d|[A-Za-z])")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
 
-_동_패턴 = re.compile(r"((?:(?:[0-9A-Za-z]+|[가-힣]|[0-9A-Za-z가-힣]+동)\s*[,~&]\s*)*[0-9A-Za-z가-힣]+동)")
+_동_패턴 = re.compile(r"((?:[0-9A-Za-z]+\s*[,~&]\s*)*[0-9A-Za-z]+동)")
 _동_제외단어 = ["인동", "주동", "공동", "자동", "수동", "전동", "연동", "이동", "작동", "부동", "진동", "명동", "구동", "개동", "각동", "해당동", "상동", "하동"]
 
-# [V6.14 패치] SUBJECT, PROJECT 관련 단어 완벽 차단
+# [V6.23 패치] 지우개 명단에 SHEET 관련 단어 정밀 타격 추가
 GLOBAL_IGNORE_HEADERS = [
     "SUBJECT TITLE", "SUBJECT", "PROJECT TITLE", "PROJECT",
     "DRAWING TITLE", "DRAWING NO.", "DRAWING NO", "DWG.NO.", "DWG. NO.", "DWG.NO", "DWG NO.", "DWG NO", "TITLE",
+    "SHEET NO.", "SHEET NO", "SHT NO.", "SHT NO", "SHEET",
     "도면번호", "도연번호", "일련번호", "연번", "NO", "NO.", "도면명", "도면명칭", "축척(A1)", "축척(A3)", "축척(A0)", 
     "SCALE(A1)", "SCALE(A3)", "SCALE(A0)", "축척(1:)", "축척(1/)", "SCALE(1:)", "SCALE(1/)", "(1:)", "(1/)",
-    "축척", "축적", "SCALE", "비고", "REMARK", "REMARKS", "사업승인", "착공", "견적", "사용승인", "1:1", "도면"
+    "축척", "축적", "SCALE", "비고", "REMARK", "REMARKS", "사업승인", "착공", "견적", "사용승인", "1:1"
 ]
 
 CATEGORY_KEYWORDS = [
@@ -130,12 +129,8 @@ def _도면번호_세척(raw_s: str) -> str:
     s = raw_s.strip().upper().replace("Λ", "A").replace("Δ", "A").replace("TOE", "108")
     if s.startswith("."): s = "AA" + s[1:]
     
-    # 띄어쓰기 낀 하이픈 정제 (A0 - 001 -> A0-001)
     s = re.sub(r"\s*([-_~])\s*", r"\1", s)
-    
-    # [V6.14 패치] 더블 하이픈 압축 (A0--006 -> A0-006)
     s = re.sub(r"[-_~]{2,}", "-", s)
-    
     return re.sub(r"\s+", " ", s)
 
 def _축척_텍스트_정리(txt: str) -> str:
@@ -177,7 +172,7 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
     유형 = ent.dxftype()
     결과 = []
     try:
-        if 유형 == "TEXT":
+        if 유형 == "TEXT" or 유형 == "ATTRIB":
             px, py = _get_safe_point(ent)
             h = getattr(ent.dxf, "height", 10.0)
             txt = (ent.dxf.text or "").strip()
@@ -189,10 +184,13 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
             for i, line in enumerate(lines):
                 txt = line.strip()
                 if txt: 결과.append((bx, by - (i * h * 1.5), txt, float(h)))
-        elif 유형 == "ATTRIB":
+        # [V6.22 유지] ATTDEF 태그 최우선 추출
+        elif 유형 == "ATTDEF":
             px, py = _get_safe_point(ent)
             h = getattr(ent.dxf, "height", 10.0)
-            txt = (ent.dxf.text or "").strip()
+            txt = getattr(ent.dxf, 'tag', '').strip() 
+            if not txt:
+                txt = getattr(ent.dxf, 'text', '').strip() 
             if txt: 결과.append((px, py, txt, float(h)))
     except Exception: pass
     return 결과
@@ -200,14 +198,14 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
 def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
     texts = []
     try:
-        for ent in layout.query("TEXT MTEXT LINE LWPOLYLINE INSERT"):
-            if ent.dxftype() in ["TEXT", "MTEXT", "LINE", "LWPOLYLINE"]:
+        for ent in layout.query("TEXT MTEXT LINE LWPOLYLINE INSERT ATTDEF"):
+            if ent.dxftype() in ["TEXT", "MTEXT", "LINE", "LWPOLYLINE", "ATTDEF"]:
                 texts.extend(_텍스트_데이터_추출(ent))
             elif ent.dxftype() == "INSERT":
                 for att in getattr(ent, "attribs", []): texts.extend(_텍스트_데이터_추출(att))
                 try:
                     for v_ent in ent.virtual_entities():
-                        if v_ent.dxftype() in ["TEXT", "MTEXT", "LINE", "LWPOLYLINE"]: texts.extend(_텍스트_데이터_추출(v_ent))
+                        if v_ent.dxftype() in ["TEXT", "MTEXT", "LINE", "LWPOLYLINE", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(v_ent))
                         elif v_ent.dxftype() == "INSERT":
                             for v_att in getattr(v_ent, "attribs", []): texts.extend(_텍스트_데이터_추출(v_att))
                 except Exception: pass
@@ -220,21 +218,20 @@ def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
             seen.add(key); out.append((float(x), float(y), clean, float(h)))
     return out
 
-# [V6.14 핵심] XREF 원본 스캐너
 def _parse_xref_original(xref_path: str) -> List[Tuple[float, float, str, float]]:
     print(f"\n[XREF] 도곽 원본 스캔 중... ({os.path.basename(xref_path)})")
     try:
         doc = _cad_로드(Path(xref_path))
         msp = doc.modelspace()
         texts = []
-        for ent in msp.query("TEXT MTEXT INSERT"): 
-            if ent.dxftype() in ["TEXT", "MTEXT"]:
+        for ent in msp.query("TEXT MTEXT INSERT ATTDEF"): 
+            if ent.dxftype() in ["TEXT", "MTEXT", "ATTDEF"]:
                 texts.extend(_텍스트_데이터_추출(ent))
             elif ent.dxftype() == "INSERT":
                 for att in getattr(ent, "attribs", []): texts.extend(_텍스트_데이터_추출(att))
                 try:
                     for v_ent in ent.virtual_entities():
-                        if v_ent.dxftype() in ["TEXT", "MTEXT"]: texts.extend(_텍스트_데이터_추출(v_ent))
+                        if v_ent.dxftype() in ["TEXT", "MTEXT", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(v_ent))
                 except Exception: pass
         seen, out = set(), []
         for x, y, txt, h in texts:
@@ -248,7 +245,6 @@ def _parse_xref_original(xref_path: str) -> List[Tuple[float, float, str, float]
         print(f"       -> [XREF 에러] {e}")
         return []
 
-# [V6.14 핵심] XREF 텍스트 투명 도장 합성기
 def _transform_xref_texts(xref_texts: List[Tuple[float, float, str, float]], ix: float, iy: float, xscale: float, yscale: float, rot_deg: float) -> List[Tuple[float, float, str, float]]:
     transformed = []
     rad = math.radians(rot_deg)
@@ -269,10 +265,43 @@ def _clean_title_only(title: str) -> str:
     clean = _clean_text_from_headers(clean)
     return clean
 
-def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], header_a1_x: Optional[float] = None, header_a3_x: Optional[float] = None) -> Tuple[str, str]:
+def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], header_a1_x: Optional[float] = None, header_a3_x: Optional[float] = None, is_list_table: bool = False) -> Tuple[str, str]:
+    texts_to_scan = []
+    lone_numbers = []
+    
+    if not is_list_table:
+        # [트랙 B] 개별 도면 모드 (수평 결합기 가동)
+        merged_texts = []
+        if cell_texts:
+            cell_texts_sorted = sorted(cell_texts, key=lambda t: (-t[1], t[0]))
+            curr_line = []
+            curr_y = None
+            for t in cell_texts_sorted:
+                x, y, txt, h = t
+                if curr_y is None:
+                    curr_y = y
+                    curr_line.append(t)
+                elif abs(curr_y - y) <= max(h * 1.5, 1.0): 
+                    curr_line.append(t)
+                else:
+                    curr_line.sort(key=lambda item: item[0])
+                    merged_txt = " ".join([item[2] for item in curr_line])
+                    merged_texts.append((curr_line[0][0], curr_y, merged_txt, curr_line[0][3]))
+                    curr_y = y
+                    curr_line = [t]
+            if curr_line:
+                curr_line.sort(key=lambda item: item[0])
+                merged_txt = " ".join([item[2] for item in curr_line])
+                merged_texts.append((curr_line[0][0], curr_y, merged_txt, curr_line[0][3]))
+        texts_to_scan = merged_texts
+    else:
+        # [트랙 A] 목록표 모드
+        texts_to_scan = cell_texts
+
     a1_val, a3_val = "X", "X"
     scales, labels = [], {}
-    for x, y, txt, h in cell_texts:
+
+    for x, y, txt, h in texts_to_scan:
         u_txt = txt.upper()
         clean_txt = u_txt.replace(" ", "")
         
@@ -284,12 +313,21 @@ def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], head
         
         if re.search(r'\bA1\b', u_txt): labels['A1'] = (x, y)
         if re.search(r'\bA3\b', u_txt): labels['A3'] = (x, y)
+        
         for m in _축척_패턴.finditer(u_txt):
             val = _축척_텍스트_정리(m.group(0))
             if val != "X": scales.append((x, y, val))
             
+        if not is_list_table and not _축척_패턴.search(u_txt):
+            m_num = re.search(r'^[\d,]+$', clean_txt)
+            if m_num:
+                val = f"1/{clean_txt.replace(',', '')}"
+                lone_numbers.append((x, y, val))
+            elif clean_txt in ["NONE", "N/A"]:
+                lone_numbers.append((x, y, "NONE"))
+            
     unique_scales, seen = [], set()
-    for sx, sy, sval in scales:
+    for sx, sy, sval in scales + lone_numbers:
         if (sx, sy, sval) not in seen:
             seen.add((sx, sy, sval)); unique_scales.append((sx, sy, sval))
             
@@ -347,7 +385,6 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                 rad = math.radians(-rot_deg)
                 cos_val, sin_val = math.cos(rad), math.sin(rad)
 
-                # XREF 텍스트 투명 도장 합성!
                 모든텍스트 = 레이아웃_원본텍스트.copy()
                 if xref_texts:
                     모든텍스트.extend(_transform_xref_texts(xref_texts, ix, iy, xscale, yscale, rot_deg))
@@ -503,7 +540,8 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                             임시_명칭 = re.sub(r"^[,\s]+|[,\s]+$", "", 임시_명칭).strip()
                             if 임시_명칭: 명칭 = 임시_명칭
 
-                        a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x)
+                        a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x, is_list_table=True)
+                        
                         데이터.append({
                             "도면번호(LIST)": 번호, 
                             "구분_LIST(동)": current_dong if current_dong != "공통" else "", 
@@ -541,7 +579,6 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                 rad = math.radians(-rot_deg)
                 cos_val, sin_val = math.cos(rad), math.sin(rad)
 
-                # XREF 텍스트 투명 도장 합성
                 모든텍스트 = 레이아웃_원본텍스트.copy()
                 if xref_texts:
                     모든텍스트.extend(_transform_xref_texts(xref_texts, ix, iy, xscale, yscale, rot_deg))
@@ -621,7 +658,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                     if 임시_명칭: 명칭 = 임시_명칭
                     
                 명칭 = _clean_title_only(명칭)
-                a1, a3 = _extract_scale_smart(s_texts)
+                a1, a3 = _extract_scale_smart(s_texts, is_list_table=False)
 
                 if 번호: 
                     데이터.append({
@@ -756,7 +793,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_6.14 (Kunwon Masterpiece - Ultimate Evolution)")
+    print(" AutoDWG Cross-Checker v_6.23 (Kunwon Masterpiece - Sheet Prefix Fix)")
     print("=" * 72)
     print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
@@ -785,7 +822,6 @@ def main():
 
     print(f"\n[성공] '{blk_name}' 설정을 로드했습니다. (원본크기: {base_w}x{base_h})")
 
-    # [V6.14 핵심] XREF 원본 파일 입력 받기
     print("\n1-5. 도곽 외부참조(XREF) 원본 DWG 파일의 경로를 입력하세요.")
     print("     (없다면 그냥 엔터를 치시면 기존 방식으로 작동합니다.)")
     xref_path = input("   경로: ").strip().strip('"')
