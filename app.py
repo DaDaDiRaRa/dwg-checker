@@ -4,16 +4,16 @@ Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights res
 본 프로그램은 건원건축의 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 사내 임직원 외 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
-app.py  —  DWG 자동 검토기 v_6.11 (Kunwon Masterpiece - Hyphen Magnet)
+app.py  —  DWG 자동 검토기 v_6.12 (Kunwon Masterpiece - Smart Header ID)
 ========================================================================
-[V6.11 주요 업데이트]
-1. 하이픈 자석(Hyphen Magnet): 속성 문자(A0, 201)와 일반 문자(-) 간의 
-   미세한 Y축 단차로 인해 하이픈이 누락되는 현상을 해결했습니다. 하이픈(-) 발견 시 
-   주변 텍스트의 Y좌표로 강제 정렬시켜, 도면 내에 존재하는 하이픈을 100% 인식합니다.
-   (존재하지 않는 하이픈을 강제로 생성하지 않아 QA 목적을 달성합니다.)
-2. 도면명 원형 보존: "A0 평면도" 등 도면명에 포함된 A0, A1 텍스트가 
-   축척 찌꺼기로 오인되어 삭제되지 않도록 지우개 로직을 개선했습니다.
-3. V6.8(다단 스캔, 비고 차단) 및 V6.9(축척 콤마 제거) 기능이 모두 포함되어 있습니다.
+[V6.12 주요 업데이트]
+1. A0, A1, A3 도면번호/도면명 완벽 보존: 기존 축척 헤더를 지우기 위한 로직이 
+   실제 도면번호(A1-001 등)까지 훼손하던 치명적 버그를 수정했습니다.
+2. 스마트 헤더 식별(Smart Header ID): A1, A3 텍스트가 좌측(도면번호 열)에 
+   위치하면 데이터로 보존하고, 우측(축척 열) 최상단에 위치할 때만 
+   정확히 식별하여 제거함으로써 도면명 오염을 방지합니다.
+3. 엑셀 텍스트 서식 에러 해결: 도면번호 앞부분이 날아가 "-001" 형태로 출력되며 
+   발생하던 Excel 텍스트/수식 경고창 문제를 원천 차단했습니다.
 ========================================================================
 """
 
@@ -128,7 +128,6 @@ def _도면번호_세척(raw_s: str) -> str:
     s = raw_s.strip().upper().replace("Λ", "A").replace("Δ", "A").replace("TOE", "108")
     if s.startswith("."): s = "AA" + s[1:]
     
-    # [V6.11 패치] 인식된 하이픈 주변의 띄어쓰기만 예쁘게 제거 (예: "A0 - 201" -> "A0-201")
     s = re.sub(r"\s*([-_~])\s*", r"\1", s)
     return re.sub(r"\s+", " ", s)
 
@@ -214,8 +213,21 @@ def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
             seen.add(key); out.append((float(x), float(y), clean, float(h)))
     return out
 
+def _split_lines_from_cell_texts(cell_texts: List[Tuple[float, float, str, float]], row_h: float) -> List[str]:
+    if not cell_texts: return []
+    cell_texts = sorted(cell_texts, key=lambda t: (-t[1], t[0]))
+    y_tol = max(row_h * 0.015, 1.0)
+    lines, current, current_y = [], [], None
+    for x, y, txt, _ in cell_texts:
+        if current_y is None: current_y = y; current.append((x, txt)); continue
+        if abs(current_y - y) <= y_tol: current.append((x, txt))
+        else:
+            current.sort(key=lambda v: v[0]); lines.append(current)
+            current_y = y; current = [(x, txt)]
+    if current: current.sort(key=lambda v: v[0]); lines.append(current)
+    return [" ".join([txt for _, txt in line]) for line in lines]
+
 def _clean_title_only(title: str) -> str:
-    # [V6.11 패치] A0, A1, A3가 포함된 도면명을 훼손하지 않음
     clean = re.sub(r"NONE|N/A|1\s?[/:,]\s?[\d,]+", " ", title, flags=re.I)
     clean = re.sub(r"(?:축척|SCALE)?\s*\(\s*1\s*[:/]\s*\)", " ", clean, flags=re.I)
     clean = re.sub(r"(?:축척|SCALE)\s*1\s*[:/]", " ", clean, flags=re.I)
@@ -282,7 +294,8 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
     list_rois = roi_cfg.get('list_rois', [])
     if not list_rois: print("⚠️ [경고] 리습에서 지정된 목록표 단(ROI)이 없습니다. 전체 스캔을 시도합니다.")
     
-    global_ignores_stripped = [h.replace(" ", "").upper() for h in GLOBAL_IGNORE_HEADERS] + ["A1", "A3", "A0"]
+    # [V6.12 패치] 글로벌 지우개에서 A1, A3, A0를 완전히 삭제하여 도면명/도면번호 오염 방지
+    global_ignores_stripped = [h.replace(" ", "").upper() for h in GLOBAL_IGNORE_HEADERS]
     
     try:
         doc = _cad_로드(Path(dwg_path))
@@ -324,16 +337,36 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                             
                             if txt == "-" and th > roi_w * 0.8: continue
                             
+                            # [V6.12 패치] 튜플 형태로 전체 보관
                             if not _extract_drawing_number(txt):
-                                if re.search(r"\bA1\b", txt.upper()): a1_matches.append((unrot_x, unrot_y))
-                                if re.search(r"\bA3\b", txt.upper()): a3_matches.append((unrot_x, unrot_y))
+                                if re.search(r"\bA1\b", txt.upper()): a1_matches.append((unrot_x, unrot_y, txt, th))
+                                if re.search(r"\bA3\b", txt.upper()): a3_matches.append((unrot_x, unrot_y, txt, th))
                             
                             if any(ih == clean_t for ih in global_ignores_stripped): continue
                             구역_텍스트.append((unrot_x, unrot_y, txt, th))
                     
                     if not 구역_텍스트: continue
                     
-                    # [V6.11 패치] 하이픈 자석 엔진 (Hyphen Magnet)
+                    header_num_x = sum(num_x_cands)/len(num_x_cands) if num_x_cands else min_x + (roi_w * 0.15)
+                    header_title_x = sum(title_x_cands)/len(title_x_cands) if title_x_cands else min_x + (roi_w * 0.5)
+                    header_remark_x = sum(remark_x_cands)/len(remark_x_cands) if remark_x_cands else max_x
+                    
+                    # [V6.12 핵심 패치] 스마트 헤더 식별기
+                    # A1/A3 글자가 도면번호(좌측)보다 도면명(우측)에서 멀리 떨어져 있는 놈들만 모아서 진짜 축척 헤더를 찾음
+                    header_a1_cands = [m for m in a1_matches if abs(m[0] - header_num_x) > abs(m[0] - header_title_x)]
+                    header_a3_cands = [m for m in a3_matches if abs(m[0] - header_num_x) > abs(m[0] - header_title_x)]
+                    
+                    header_a1_item = sorted(header_a1_cands, key=lambda v: -v[1])[0] if header_a1_cands else None
+                    header_a3_item = sorted(header_a3_cands, key=lambda v: -v[1])[0] if header_a3_cands else None
+                    
+                    # 도면 오염을 막기 위해 '진짜 축척 헤더'로 판명된 딱 1개의 글자만 구역에서 영구 삭제
+                    if header_a1_item and header_a1_item in 구역_텍스트: 구역_텍스트.remove(header_a1_item)
+                    if header_a3_item and header_a3_item in 구역_텍스트: 구역_텍스트.remove(header_a3_item)
+                    
+                    header_a1_x = header_a1_item[0] if header_a1_item else None
+                    header_a3_x = header_a3_item[0] if header_a3_item else None
+
+                    # 하이픈 자석 엔진
                     for i in range(len(구역_텍스트)):
                         tx, ty, txt, th = 구역_텍스트[i]
                         if txt.strip() in ["-", "_", "~"]:
@@ -343,20 +376,13 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                                 if i == j: continue
                                 ox, oy, otxt, oth = 구역_텍스트[j]
                                 if otxt.strip() not in ["-", "_", "~"]:
-                                    if abs(ty - oy) < 높이 * 0.025: # Y축 단차 허용 (하이픈 끌어당기기)
+                                    if abs(ty - oy) < 높이 * 0.025:
                                         dist_x = abs(tx - ox)
                                         if dist_x < min_dist:
                                             min_dist = dist_x
                                             closest_y = oy
                             구역_텍스트[i] = (tx, closest_y, txt, th)
 
-                    header_num_x = sum(num_x_cands)/len(num_x_cands) if num_x_cands else min_x + (roi_w * 0.15)
-                    header_title_x = sum(title_x_cands)/len(title_x_cands) if title_x_cands else min_x + (roi_w * 0.5)
-                    header_remark_x = sum(remark_x_cands)/len(remark_x_cands) if remark_x_cands else max_x
-                    
-                    header_a1_x = sorted(a1_matches, key=lambda v: -v[1])[0][0] if a1_matches else None
-                    header_a3_x = sorted(a3_matches, key=lambda v: -v[1])[0][0] if a3_matches else None
-                            
                     tight_y_tol = 높이 * 0.012 
                     구역_텍스트.sort(key=lambda x: -x[1]) 
                     
@@ -495,7 +521,6 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                             
                     if not 박스내글자: return "", []
                     
-                    # [V6.11 패치] 하이픈 자석 엔진 (Hyphen Magnet) - 개별 도면용
                     for i in range(len(박스내글자)):
                         tx, ty, txt, th = 박스내글자[i]
                         if txt.strip() in ["-", "_", "~"]:
@@ -689,7 +714,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_6.11 (Kunwon Masterpiece - Hyphen Magnet)")
+    print(" AutoDWG Cross-Checker v_6.12 (Kunwon Masterpiece - Smart Header ID)")
     print("=" * 72)
     print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
