@@ -4,17 +4,16 @@ Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights res
 본 프로그램은 건원건축의 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 사내 임직원 외 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
-app.py  —  DWG 자동 검토기 v_6.8 (Kunwon Masterpiece - Multi-Zoning & Cleanup)
+app.py  —  DWG 자동 검토기 v_6.11 (Kunwon Masterpiece - Hyphen Magnet)
 ========================================================================
-[V6.8 주요 업데이트]
-1. 다단(Multi-Column) ROI 완벽 지원: 리습에서 지정한 N개의 목록표 단(박스)을 
-   각각 독립된 구역으로 인식하여 분석합니다.
-2. 스마트 정제 엔진 탑재: 
-   - 도연번호(오타) 인식
-   - 일련번호(도면번호 좌측 텍스트) 절단
-   - 비고(Remarks) 차단막 설치 (도면명과 분리)
-   - 축척(1:) 등 범례 찌꺼기 완벽 청소
-   - 카테고리 행(A0 [공통사항] 등) 자동 스킵
+[V6.11 주요 업데이트]
+1. 하이픈 자석(Hyphen Magnet): 속성 문자(A0, 201)와 일반 문자(-) 간의 
+   미세한 Y축 단차로 인해 하이픈이 누락되는 현상을 해결했습니다. 하이픈(-) 발견 시 
+   주변 텍스트의 Y좌표로 강제 정렬시켜, 도면 내에 존재하는 하이픈을 100% 인식합니다.
+   (존재하지 않는 하이픈을 강제로 생성하지 않아 QA 목적을 달성합니다.)
+2. 도면명 원형 보존: "A0 평면도" 등 도면명에 포함된 A0, A1 텍스트가 
+   축척 찌꺼기로 오인되어 삭제되지 않도록 지우개 로직을 개선했습니다.
+3. V6.8(다단 스캔, 비고 차단) 및 V6.9(축척 콤마 제거) 기능이 모두 포함되어 있습니다.
 ========================================================================
 """
 
@@ -41,6 +40,7 @@ ODA_DOWNLOAD_URL = "https://www.opendesign.com/guestfiles/oda_file_converter"
 def load_roi_config(block_name: str) -> Optional[dict]:
     config_dir = os.path.join(os.environ.get('APPDATA', ''), 'AutoDWG_Checker')
     config_path = os.path.join(config_dir, f"{block_name}.json")
+    
     if os.path.exists(config_path):
         for enc in ['cp949', 'utf-8', 'euc-kr']:
             try:
@@ -84,7 +84,8 @@ def check_oda_installation():
 # 1. 공통 유틸리티 (지우개 및 필터)
 # ============================================================================
 _도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[-.~–—−]\d{1,3})?[A-Z]*|TOE)(?!\d|[A-Za-z])")
-_축척_패턴 = re.compile(r"(1\s?[/:,]\s?(\d{1,4})|NONE|N/A)", re.I)
+_축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
+
 _동_패턴 = re.compile(r"((?:(?:[0-9A-Za-z]+|[가-힣]|[0-9A-Za-z가-힣]+동)\s*[,~&]\s*)*[0-9A-Za-z가-힣]+동)")
 _동_제외단어 = ["인동", "주동", "공동", "자동", "수동", "전동", "연동", "이동", "작동", "부동", "진동", "명동", "구동", "개동", "각동", "해당동", "상동", "하동"]
 
@@ -126,6 +127,9 @@ def _도면번호_세척(raw_s: str) -> str:
     if not raw_s: return ""
     s = raw_s.strip().upper().replace("Λ", "A").replace("Δ", "A").replace("TOE", "108")
     if s.startswith("."): s = "AA" + s[1:]
+    
+    # [V6.11 패치] 인식된 하이픈 주변의 띄어쓰기만 예쁘게 제거 (예: "A0 - 201" -> "A0-201")
+    s = re.sub(r"\s*([-_~])\s*", r"\1", s)
     return re.sub(r"\s+", " ", s)
 
 def _축척_텍스트_정리(txt: str) -> str:
@@ -133,7 +137,9 @@ def _축척_텍스트_정리(txt: str) -> str:
     u = txt.upper()
     if "NONE" in u or "N/A" in u: return "NONE"
     m = _축척_패턴.search(u)
-    return f"1/{m.group(2)}" if m and m.group(2) else "X"
+    if m and m.group(2):
+        return f"1/{m.group(2).replace(',', '')}"
+    return "X"
 
 def _extract_drawing_number(text: str) -> Optional[str]:
     for m in _도면번호_패턴.finditer(text):
@@ -209,7 +215,8 @@ def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
     return out
 
 def _clean_title_only(title: str) -> str:
-    clean = re.sub(r"\bA1\b|\bA3\b|\bA0\b|NONE|N/A|1\s?[/:,]\s?\d{1,4}", " ", title, flags=re.I)
+    # [V6.11 패치] A0, A1, A3가 포함된 도면명을 훼손하지 않음
+    clean = re.sub(r"NONE|N/A|1\s?[/:,]\s?[\d,]+", " ", title, flags=re.I)
     clean = re.sub(r"(?:축척|SCALE)?\s*\(\s*1\s*[:/]\s*\)", " ", clean, flags=re.I)
     clean = re.sub(r"(?:축척|SCALE)\s*1\s*[:/]", " ", clean, flags=re.I)
     clean = _clean_text_from_headers(clean)
@@ -221,9 +228,11 @@ def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], head
     for x, y, txt, h in cell_texts:
         u_txt = txt.upper()
         clean_txt = u_txt.replace(" ", "")
-        m_a1 = re.search(r'A1.*?(1\s?[/:,]\s?\d{1,4}|NONE|N/A)', clean_txt)
+        
+        m_a1 = re.search(r'A1.*?(1\s?[/:,]\s?[\d,]+|NONE|N/A)', clean_txt)
         if m_a1 and a1_val == "X": a1_val = _축척_텍스트_정리(m_a1.group(1))
-        m_a3 = re.search(r'A3.*?(1\s?[/:,]\s?\d{1,4}|NONE|N/A)', clean_txt)
+        
+        m_a3 = re.search(r'A3.*?(1\s?[/:,]\s?[\d,]+|NONE|N/A)', clean_txt)
         if m_a3 and a3_val == "X": a3_val = _축척_텍스트_정리(m_a3.group(1))
         
         if re.search(r'\bA1\b', u_txt): labels['A1'] = (x, y)
@@ -291,7 +300,6 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
 
                 target_ranges = list_rois if list_rois else [[0.0, 1.0, 0.0, 1.0]]
                 
-                # 리습에서 친 단(Box) 개수만큼 반복 스캔
                 for roi_idx, roi in enumerate(target_ranges):
                     min_x, max_x = ix + (너비 * roi[0]), ix + (너비 * roi[1])
                     y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3])
@@ -310,7 +318,6 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                         if min_x <= unrot_x <= max_x and y_min <= unrot_y <= y_max:
                             clean_t = txt.replace(" ", "").replace("\n", "").strip().upper()
                             
-                            # 앵커(등대) 좌표 수집
                             if clean_t in ["도면번호", "도연번호", "DWG.NO", "DWG.NO.", "DWGNO", "DRAWINGNO", "번호"]: num_x_cands.append(unrot_x)
                             if clean_t in ["도면명", "DRAWINGTITLE", "TITLE", "도면명칭"]: title_x_cands.append(unrot_x)
                             if clean_t in ["비고", "REMARK", "REMARKS"]: remark_x_cands.append(unrot_x)
@@ -326,6 +333,23 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                     
                     if not 구역_텍스트: continue
                     
+                    # [V6.11 패치] 하이픈 자석 엔진 (Hyphen Magnet)
+                    for i in range(len(구역_텍스트)):
+                        tx, ty, txt, th = 구역_텍스트[i]
+                        if txt.strip() in ["-", "_", "~"]:
+                            closest_y = ty
+                            min_dist = float('inf')
+                            for j in range(len(구역_텍스트)):
+                                if i == j: continue
+                                ox, oy, otxt, oth = 구역_텍스트[j]
+                                if otxt.strip() not in ["-", "_", "~"]:
+                                    if abs(ty - oy) < 높이 * 0.025: # Y축 단차 허용 (하이픈 끌어당기기)
+                                        dist_x = abs(tx - ox)
+                                        if dist_x < min_dist:
+                                            min_dist = dist_x
+                                            closest_y = oy
+                            구역_텍스트[i] = (tx, closest_y, txt, th)
+
                     header_num_x = sum(num_x_cands)/len(num_x_cands) if num_x_cands else min_x + (roi_w * 0.15)
                     header_title_x = sum(title_x_cands)/len(title_x_cands) if title_x_cands else min_x + (roi_w * 0.5)
                     header_remark_x = sum(remark_x_cands)/len(remark_x_cands) if remark_x_cands else max_x
@@ -351,13 +375,11 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                     for sub in sub_lines:
                         full_str = " ".join([t[2] for t in sub['texts']])
                         
-                        # [카테고리 스킵] "A0 [공통사항]" 등 버리기
                         is_category = False
                         if any(kw in full_str.replace(" ", "") for kw in CATEGORY_KEYWORDS): is_category = True
                         elif re.search(r"^[A-Z0-9\-_]*\s*[\[<【].+?[\]>】]\s*$", full_str): is_category = True
                         if is_category: continue
 
-                        # [도면번호 추출]
                         raw_drw_no = _extract_drawing_number(full_str)
                         drw_no, raw_matched_str = "", ""
 
@@ -365,7 +387,6 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                             drw_no = _도면번호_세척(raw_drw_no)
                             raw_matched_str = raw_drw_no
                         else:
-                            # 앵커 기반으로 좌측 텍스트 추정
                             num_texts = [t for t in sub['texts'] if abs(t[0] - header_num_x) <= abs(t[0] - header_title_x)]
                             if num_texts:
                                 raw_left_str = " ".join([t[2] for t in num_texts])
@@ -393,7 +414,6 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                         for sub in row['sub_lines']:
                             sub_texts_sorted = sorted(sub['texts'], key=lambda x: x[0])
                             
-                            # [비고 차단막] 비고 앵커 주변 글자는 버림
                             title_texts = []
                             for t in sub_texts_sorted:
                                 if header_remark_x and abs(t[0] - header_remark_x) < abs(t[0] - header_title_x): continue
@@ -401,7 +421,6 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                                 
                             raw_left_str = " ".join([t[2] for t in title_texts])
                             
-                            # [일련번호 절단기] 도면번호보다 왼쪽에 있는 글자(1, 2, 3 등)는 날림
                             title_overflow = raw_left_str
                             if sub.get('raw_drw_no') and sub['raw_drw_no'] in raw_left_str:
                                 parts = raw_left_str.split(sub['raw_drw_no'], 1)
@@ -475,6 +494,24 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                             박스내글자.append((unrot_x, unrot_y, txt, th)) 
                             
                     if not 박스내글자: return "", []
+                    
+                    # [V6.11 패치] 하이픈 자석 엔진 (Hyphen Magnet) - 개별 도면용
+                    for i in range(len(박스내글자)):
+                        tx, ty, txt, th = 박스내글자[i]
+                        if txt.strip() in ["-", "_", "~"]:
+                            closest_y = ty
+                            min_dist = float('inf')
+                            for j in range(len(박스내글자)):
+                                if i == j: continue
+                                ox, oy, otxt, oth = 박스내글자[j]
+                                if otxt.strip() not in ["-", "_", "~"]:
+                                    if abs(ty - oy) < 높이 * 0.025:
+                                        dist_x = abs(tx - ox)
+                                        if dist_x < min_dist:
+                                            min_dist = dist_x
+                                            closest_y = oy
+                            박스내글자[i] = (tx, closest_y, txt, th)
+                    
                     박스내글자.sort(key=lambda t: -t[1])
                     lines, current_line, current_y = [], [], None
                     y_tol = 높이 * 0.015
@@ -496,11 +533,19 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float]) -> Tuple[List
                 t_str_clean = _clean_text_from_headers(t_str)
 
                 번호_후보 = _extract_drawing_number(n_str_clean)
-                if 번호_후보: 번호 = _도면번호_세척(번호_후보)
-                else: 번호 = re.sub(r"\s*[가-힣\[<【\(].*$", "", n_str_clean).strip("-_ ")
+                raw_matched_str = ""
+                
+                if 번호_후보: 
+                    번호 = _도면번호_세척(번호_후보)
+                    raw_matched_str = 번호_후보
+                else: 
+                    fallback_match = re.sub(r"\s*[가-힣\[<【\(].*$", "", n_str_clean).strip("-_ ")
+                    번호 = _도면번호_세척(fallback_match)
+                    raw_matched_str = fallback_match
                 
                 명칭 = t_str_clean
-                if 번호 and 번호 in 명칭: 명칭 = 명칭.replace(번호, "")
+                if raw_matched_str and raw_matched_str in 명칭:
+                    명칭 = 명칭.replace(raw_matched_str, "")
 
                 dwg_dong = _extract_dong_from_title(명칭)
                 if dwg_dong:
@@ -644,7 +689,7 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
 # ============================================================================
 def main():
     print("=" * 72)
-    print(" AutoDWG Cross-Checker v_6.8 (Kunwon Masterpiece - Multi-Zoning)")
+    print(" AutoDWG Cross-Checker v_6.11 (Kunwon Masterpiece - Hyphen Magnet)")
     print("=" * 72)
     print(" Copyright (c) 2026 건원건축(Kunwon Architecture) & 김정현. All rights reserved.")
     print("=" * 72)
