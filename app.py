@@ -4,16 +4,16 @@ Copyright (c) 2026 건원건축 김정현. All rights reserved.
 본 프로그램은 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
-app.py  —  DWG 자동 검토기 v_6.5 GUI Smart Edition (Kunwon Masterpiece)
+
+app.py  —  DWG 자동 검토기 v_6.7 Ultimate Edition (Kunwon Masterpiece)
 ========================================================================
-[V6.5 GUI 업데이트]
-1. CustomTkinter 도입: 깔끔한 라이트 모드 기반의 세련된 윈도우 응용프로그램 UI 적용.
-2. 스마트 자동 완성(Auto-Fill): 1. XREF 파일을 선택하면 파일명에서 확장자를 제외한 
-   이름이 2. 도곽 블록 이름에 자동으로 채워지도록 UX(사용자 경험) 동선 완벽 개선.
-3. 멀티스레딩(Multi-threading) 적용: 무거운 도면 분석 중에도 프로그램 창이 
-   응답 없음(멈춤) 상태에 빠지지 않도록 UI 스레드와 분석 스레드를 분리.
-4. 코어 엔진 V6.24 적용: 기호 납치(SHEET) 방지, ATTDEF 태그 우선 추출, 
-   투 트랙(목록/개별) 병렬 분석 등 모든 무결성 검증 로직 100% 탑재.
+[V6.7 업데이트]
+1. Drag & Drop 완벽 지원: 윈도우 탐색기에서 파일(.dwg)이나 폴더를 마우스로 끌어서 
+   프로그램 창에 던지면(Drop) 경로가 자동으로 인식되고 세팅됩니다.
+2. 스마트 숨김형 UI (Progressive Disclosure): 평소에는 심플하게 1개의 도곽 이름만 받지만, 
+   체크박스를 켜면 [목록표(Master) / 개별도면(Slave)] 도곽 이름을 분리해서 탐색합니다.
+   (박스 좌표는 무조건 Master 기준, 개별도면 탐색은 Slave 이름 기준으로 작동)
+3. 무한 체인 정규식 (V6.6 로직 유지): AA-000-000-000 무제한 추출 완벽 적용.
 ========================================================================
 """
 
@@ -31,19 +31,19 @@ import ezdxf
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import customtkinter as ctk
+from tkinterdnd2 import TkinterDnD, DND_FILES  # [V6.7 추가] 드래그 앤 드롭 엔진
 
 # ============================================================================
-# [UI 테마 설정] 깔끔하고 전문적인 라이트 모드
+# [UI 테마 설정]
 # ============================================================================
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 
-# 리포트 파일 기본 이름
 리포트_이름: str = "도면검토리포트_최종.xlsx"
 ODA_DOWNLOAD_URL = "https://www.opendesign.com/guestfiles/oda_file_converter"
 
 # ============================================================================
-# 0. 기존 코어 엔진 설정
+# 0. 기존 코어 엔진 (JSON 로드 및 ODA)
 # ============================================================================
 def load_roi_config(block_name: str) -> Optional[dict]:
     config_dir = os.path.join(os.environ.get('APPDATA', ''), 'AutoDWG_Checker')
@@ -76,9 +76,9 @@ def _oda_환경_설정() -> str:
     return found_path
 
 # ============================================================================
-# 1. 공통 유틸리티 (지우개 및 필터)
+# 1. 공통 유틸리티 (무한체인 정규식 및 필터)
 # ============================================================================
-_도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[-.~–—−]\d{1,3})?[A-Z]*|TOE)(?!\d|[A-Za-z])")
+_도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[\s\-_~–—−]+\d{1,5})*[A-Z]*|TOE)(?!\d|[A-Za-z])")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
 _동_패턴 = re.compile(r"((?:[0-9A-Za-z]+\s*[,~&]\s*)*[0-9A-Za-z]+동)")
 _동_제외단어 = ["인동", "주동", "공동", "자동", "수동", "전동", "연동", "이동", "작동", "부동", "진동", "명동", "구동", "개동", "각동", "해당동", "상동", "하동"]
@@ -247,10 +247,8 @@ def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], head
     a1_val, a3_val = "X", "X"; scales, labels = [], {}
     for x, y, txt, h in texts_to_scan:
         u_txt = txt.upper(); clean_txt = u_txt.replace(" ", "")
-        
         m_a1 = re.search(r'A1.*?(1\s?[/:,]\s?[\d,]+|NONE|N/A)', clean_txt)
         if m_a1 and a1_val == "X": a1_val = _축척_텍스트_정리(m_a1.group(1))
-        
         m_a3 = re.search(r'A3.*?(1\s?[/:,]\s?[\d,]+|NONE|N/A)', clean_txt)
         if m_a3 and a3_val == "X": a3_val = _축척_텍스트_정리(m_a3.group(1))
         
@@ -297,7 +295,7 @@ def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], head
     return a1_val, a3_val
 
 # ============================================================================
-# 2. 도면목록표 및 개별 도면 파싱 코어
+# 2. 도면목록표 및 개별 도면 파싱 코어 (Master/Slave 분리 적용)
 # ============================================================================
 def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> pd.DataFrame:
     print(f"\n[LIST] DWG 도면목록표 분석 시작: {os.path.basename(dwg_path)}")
@@ -434,6 +432,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
     try:
         doc = _cad_로드(Path(전체경로)); 도곽_발견됨 = False
         for layout in doc.layouts:
+            # [핵심] 사용자가 지정한 개별도면용 '목표블록' 이름(Slave)으로 찾습니다.
             도곽들 = [ins for ins in layout.query("INSERT") if 목표블록 in ins.dxf.name.lower()]
             if not 도곽들: continue
             도곽_발견됨 = True; 레이아웃_원본텍스트 = _collect_layout_texts(layout)
@@ -441,12 +440,12 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                 ix, iy = float(도곽.dxf.insert.x), float(도곽.dxf.insert.y)
                 xscale, yscale = abs(float(도곽.dxf.xscale)), abs(float(도곽.dxf.yscale))
                 너비, 높이 = base_w * xscale, base_h * yscale
-                rot_deg = getattr(도곽.dxf, 'rotation', 0.0)
-                rad = math.radians(-rot_deg); cos_val, sin_val = math.cos(rad), math.sin(rad)
+                rot_deg = getattr(도곽.dxf, 'rotation', 0.0); rad = math.radians(-rot_deg); cos_val, sin_val = math.cos(rad), math.sin(rad)
                 모든텍스트 = 레이아웃_원본텍스트.copy()
                 if xref_texts: 모든텍스트.extend(_transform_xref_texts(xref_texts, ix, iy, xscale, yscale, rot_deg))
 
                 def get_data_in_roi(roi):
+                    # [핵심] 비율은 Master의 roi_cfg에 저장된 것을 그대로 씁니다.
                     x_min, x_max = ix + (너비 * roi[0]), ix + (너비 * roi[1])
                     y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3]); 박스내글자 = []
                     for t in 모든텍스트:
@@ -503,7 +502,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
     except Exception as e: 에러메시지 = str(e)
     return 데이터, 에러메시지
 
-def extract_dwg_data_multiprocess(target_dirs: List[str], block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> pd.DataFrame:
+def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> pd.DataFrame:
     모든_캐드파일 = []
     for d in target_dirs:
         폴더 = Path(d)
@@ -512,10 +511,10 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], block_name: str, roi_c
     if not 캐드파일들:
         print("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
 
-    print(f"\n[CAD ] 총 {len(캐드파일들)}개의 도면 분석 중... (터보 모드 가동 🚀)")
+    print(f"\n[CAD ] 총 {len(캐드파일들)}개의 개별 도면 분석 중... (터보 모드 가동 🚀)")
     최종_데이터 = []
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        futures = {executor.submit(_process_single_dwg, (path, block_name.strip().lower(), roi_cfg, base_w, base_h, xref_texts)): path for path in 캐드파일들}
+        futures = {executor.submit(_process_single_dwg, (path, slave_block_name.strip().lower(), roi_cfg, base_w, base_h, xref_texts)): path for path in 캐드파일들}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             경로 = futures[future]
             try:
@@ -600,10 +599,9 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
     print(f"\n[XLSX] 리포트 저장 완료: {out_path}")
 
 # ============================================================================
-# 3. [GUI 구축] CustomTkinter 윈도우 클래스
+# 3. [GUI 구축] CustomTkinter + TkinterDnD (드래그 앤 드롭 지원)
 # ============================================================================
 class StdoutRedirector:
-    """print() 문을 GUI 로그 창으로 리디렉션하는 클래스"""
     def __init__(self, textbox: ctk.CTkTextbox):
         self.textbox = textbox
 
@@ -613,15 +611,16 @@ class StdoutRedirector:
         self.textbox.see("end")
         self.textbox.configure(state="disabled")
 
-    def flush(self):
-        pass
+    def flush(self): pass
 
-class AutoDWGApp(ctk.CTk):
+# [핵심] ctk.CTk와 TkinterDnD.DnDWrapper를 결합하여 D&D 윈도우 생성
+class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
+        self.TkdndVersion = TkinterDnD._require(self)
         
-        self.title("도면목록표 ↔ 개별도면 자동 검토기")
-        self.geometry("750x800")
+        self.title("도면목록표 ↔ 개별도면 자동 검토기 V6.7 Ultimate")
+        self.geometry("750x850")
         self.resizable(False, False)
         
         self.xref_path = ""
@@ -629,53 +628,69 @@ class AutoDWGApp(ctk.CTk):
         self.dwg_folders = []
 
         self._build_ui()
-        
-        # 시스템 print()를 GUI 로그창으로 연결
         sys.stdout = StdoutRedirector(self.log_box)
         
         print("=" * 72)
-        print(" AutoDWG Cross-Checker V1.0 Copyright (c) 2026 김정현. All rights reserved.")
+        print(" AutoDWG Cross-Checker V6.7 (Ultimate Edition)")
         print("=" * 72)
-        print(" 환영합니다! 분석할 파일과 폴더를 선택한 후 검토를 시작하세요.\n")
+        print(" 환영합니다! 파일이나 폴더를 '드래그 앤 드롭' 하거나 버튼으로 추가하세요.\n")
+
+    def _parse_dnd_paths(self, dnd_data):
+        # 윈도우 탐색기에서 넘어온 복잡한 경로 문자열({} 포함 등)을 깔끔한 리스트로 분리
+        return self.tk.splitlist(dnd_data)
 
     def _build_ui(self):
-        # 폰트 설정
         font_title = ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold")
         font_main = ctk.CTkFont(family="Malgun Gothic", size=13)
         font_bold = ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold")
 
-        # 메인 프레임
         main_frame = ctk.CTkFrame(self, fg_color="transparent")
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        # 타이틀
         title_label = ctk.CTkLabel(main_frame, text="AutoDWG 검토 자동화 시스템", font=font_title, text_color="#1f538d")
         title_label.pack(pady=(0, 20))
 
-        # 1. XREF 파일 선택 (순서 1번으로 변경)
+        # -------------------------------------------------------------
+        # 1. 도곽 원본 (XREF) 및 공통 도곽 이름
+        # -------------------------------------------------------------
         frame1 = ctk.CTkFrame(main_frame)
         frame1.pack(fill="x", pady=5)
-        ctk.CTkLabel(frame1, text="1. 도곽 원본(XREF):", font=font_bold, width=150, anchor="w").pack(side="left", padx=15, pady=10)
-        ctk.CTkButton(frame1, text="파일 찾기", font=font_main, width=100, command=self.select_xref).pack(side="left", padx=10)
-        self.lbl_xref = ctk.CTkLabel(frame1, text="(선택 안함 - 기존 방식)", font=font_main, text_color="gray")
+        
+        # D&D 타겟 설정
+        frame1.drop_target_register(DND_FILES)
+        frame1.dnd_bind('<<Drop>>', self.drop_xref)
+
+        f1_top = ctk.CTkFrame(frame1, fg_color="transparent")
+        f1_top.pack(fill="x", padx=15, pady=(10, 5))
+        ctk.CTkLabel(f1_top, text="1. 도곽 원본(XREF):", font=font_bold, width=150, anchor="w").pack(side="left")
+        ctk.CTkButton(f1_top, text="파일 찾기", font=font_main, width=100, command=self.select_xref).pack(side="left", padx=10)
+        self.lbl_xref = ctk.CTkLabel(f1_top, text="(여기에 파일을 끌어다 놓으세요)", font=font_main, text_color="gray")
         self.lbl_xref.pack(side="left", padx=10)
 
-        # 2. 도곽 블록 이름 입력 (순서 2번으로 변경, 자동 입력)
-        frame2 = ctk.CTkFrame(main_frame)
-        frame2.pack(fill="x", pady=5)
-        ctk.CTkLabel(frame2, text="2. 도곽 블록 이름:", font=font_bold, width=150, anchor="w").pack(side="left", padx=15, pady=10)
-        self.entry_block_name = ctk.CTkEntry(frame2, font=font_main, width=300, placeholder_text="(위에서 파일 선택 시 자동 입력됩니다)")
+        f1_bot = ctk.CTkFrame(frame1, fg_color="transparent")
+        f1_bot.pack(fill="x", padx=15, pady=(5, 10))
+        ctk.CTkLabel(f1_bot, text="2. 공통 도곽 블록 이름:", font=font_bold, width=150, anchor="w").pack(side="left")
+        self.entry_block_name = ctk.CTkEntry(f1_bot, font=font_main, width=300, placeholder_text="(위에서 파일 선택/드롭 시 자동 입력됨)")
         self.entry_block_name.pack(side="left", padx=10)
 
-        # 3. 도면목록표 선택
+        # -------------------------------------------------------------
+        # 2. 도면목록표 (LIST)
+        # -------------------------------------------------------------
         frame3 = ctk.CTkFrame(main_frame)
         frame3.pack(fill="x", pady=5)
+        
+        # D&D 타겟 설정
+        frame3.drop_target_register(DND_FILES)
+        frame3.dnd_bind('<<Drop>>', self.drop_list)
+
         ctk.CTkLabel(frame3, text="3. 도면목록표 DWG:", font=font_bold, width=150, anchor="w").pack(side="left", padx=15, pady=10)
         ctk.CTkButton(frame3, text="파일 찾기", font=font_main, width=100, command=self.select_list).pack(side="left", padx=10)
-        self.lbl_list = ctk.CTkLabel(frame3, text="(필수) 도면목록표 파일을 선택하세요.", font=font_main, text_color="red")
+        self.lbl_list = ctk.CTkLabel(frame3, text="(여기에 파일을 끌어다 놓으세요)", font=font_main, text_color="gray")
         self.lbl_list.pack(side="left", padx=10)
 
-        # 4. 개별도면 폴더 추가
+        # -------------------------------------------------------------
+        # 3. 개별 도면 폴더
+        # -------------------------------------------------------------
         frame4 = ctk.CTkFrame(main_frame)
         frame4.pack(fill="x", pady=5)
         
@@ -687,29 +702,72 @@ class AutoDWGApp(ctk.CTk):
         
         self.textbox_folders = ctk.CTkTextbox(frame4, height=80, font=ctk.CTkFont(family="Malgun Gothic", size=11))
         self.textbox_folders.pack(fill="x", padx=15, pady=(0, 10))
-        self.textbox_folders.insert("1.0", "추가된 폴더가 없습니다.")
+        self.textbox_folders.insert("1.0", "여기에 폴더를 끌어다 놓으세요.")
         self.textbox_folders.configure(state="disabled")
+        
+        # D&D 타겟 설정
+        self.textbox_folders.drop_target_register(DND_FILES)
+        self.textbox_folders.dnd_bind('<<Drop>>', self.drop_folders)
 
-        # 실행 버튼
+        # -------------------------------------------------------------
+        # 4. 스마트 숨김형 UI (도곽 이름 다를 경우)
+        # -------------------------------------------------------------
+        self.check_diff_name = ctk.CTkCheckBox(main_frame, text="✅ 개별도면의 도곽 이름이 도면목록표와 다를 경우 체크", font=font_main, command=self.toggle_diff_name)
+        self.check_diff_name.pack(pady=5, anchor="w", padx=10)
+
+        self.frame_diff = ctk.CTkFrame(main_frame, fg_color="transparent")
+        ctk.CTkLabel(self.frame_diff, text="↳ 개별도면용 도곽 이름:", font=font_bold, text_color="#d65151").pack(side="left", padx=(30, 10))
+        self.entry_slave_block = ctk.CTkEntry(self.frame_diff, font=font_main, width=250, placeholder_text="예: XR-form")
+        self.entry_slave_block.pack(side="left")
+
+        # -------------------------------------------------------------
+        # 실행 버튼 및 로그 콘솔
+        # -------------------------------------------------------------
         self.btn_start = ctk.CTkButton(main_frame, text="검토 시작 🚀", font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold"), height=45, command=self.start_process)
         self.btn_start.pack(fill="x", pady=20)
 
-        # 로그 콘솔
         ctk.CTkLabel(main_frame, text="작업 진행 상황 (Log Console)", font=font_bold, anchor="w").pack(fill="x")
-        self.log_box = ctk.CTkTextbox(main_frame, height=200, font=ctk.CTkFont(family="Consolas", size=12), fg_color="#f0f0f0", text_color="black")
+        self.log_box = ctk.CTkTextbox(main_frame, height=180, font=ctk.CTkFont(family="Consolas", size=12), fg_color="#f0f0f0", text_color="black")
         self.log_box.pack(fill="both", expand=True, pady=(5, 0))
         self.log_box.configure(state="disabled")
 
+    # ================= UI 로직 =================
+    def toggle_diff_name(self):
+        if self.check_diff_name.get(): self.frame_diff.pack(fill="x", after=self.check_diff_name, pady=5)
+        else: self.frame_diff.pack_forget()
+
+    # ================= D&D 핸들러 =================
+    def drop_xref(self, event):
+        paths = self._parse_dnd_paths(event.data)
+        if paths and paths[0].lower().endswith(('.dwg', '.dxf')):
+            self.xref_path = paths[0]
+            self.lbl_xref.configure(text=os.path.basename(self.xref_path), text_color="black")
+            base_name = os.path.splitext(os.path.basename(self.xref_path))[0]
+            self.entry_block_name.delete(0, "end"); self.entry_block_name.insert(0, base_name)
+            print(f"[알림] 드래그 앤 드롭: 원본 도곽 이름({base_name}) 자동 입력됨.")
+
+    def drop_list(self, event):
+        paths = self._parse_dnd_paths(event.data)
+        if paths and paths[0].lower().endswith(('.dwg', '.dxf')):
+            self.list_path = paths[0]
+            self.lbl_list.configure(text=os.path.basename(self.list_path), text_color="blue")
+            print(f"[알림] 드래그 앤 드롭: 도면목록표 인식 완료.")
+
+    def drop_folders(self, event):
+        paths = self._parse_dnd_paths(event.data)
+        for p in paths:
+            if os.path.isdir(p) and p not in self.dwg_folders:
+                self.dwg_folders.append(p)
+        self.update_folder_textbox()
+
+    # ================= 기존 버튼 핸들러 =================
     def select_xref(self):
         path = filedialog.askopenfilename(title="외부참조(XREF) 파일 선택", filetypes=[("AutoCAD Files", "*.dwg *.dxf")])
         if path:
             self.xref_path = path
             self.lbl_xref.configure(text=os.path.basename(path), text_color="black")
-            
-            # [V6.5 추가 기능] XREF 파일명에서 도곽 블록 이름 자동 추출 및 채우기
             base_name = os.path.splitext(os.path.basename(path))[0]
-            self.entry_block_name.delete(0, "end")
-            self.entry_block_name.insert(0, base_name)
+            self.entry_block_name.delete(0, "end"); self.entry_block_name.insert(0, base_name)
             print(f"[알림] 원본 파일명 기반으로 도곽 블록 이름({base_name})이 자동 입력되었습니다.")
 
     def select_list(self):
@@ -731,84 +789,79 @@ class AutoDWGApp(ctk.CTk):
     def update_folder_textbox(self):
         self.textbox_folders.configure(state="normal")
         self.textbox_folders.delete("1.0", "end")
-        if not self.dwg_folders:
-            self.textbox_folders.insert("1.0", "추가된 폴더가 없습니다.")
+        if not self.dwg_folders: self.textbox_folders.insert("1.0", "여기에 폴더를 끌어다 놓으세요.")
         else:
-            for i, f in enumerate(self.dwg_folders, 1):
-                self.textbox_folders.insert("end", f"[{i}] {f}\n")
+            for i, f in enumerate(self.dwg_folders, 1): self.textbox_folders.insert("end", f"[{i}] {f}\n")
         self.textbox_folders.configure(state="disabled")
 
+    # ================= 실행 로직 =================
     def start_process(self):
-        blk_name = self.entry_block_name.get().strip()
-        if not blk_name:
-            messagebox.showwarning("입력 오류", "도곽 블록 이름을 입력하세요.")
-            return
-        if not self.list_path:
-            messagebox.showwarning("입력 오류", "도면목록표 파일을 선택하세요.")
-            return
-        if not self.dwg_folders:
-            messagebox.showwarning("입력 오류", "분석할 개별 도면 폴더를 하나 이상 추가하세요.")
-            return
+        master_blk = self.entry_block_name.get().strip()
+        slave_blk = master_blk
+
+        if not master_blk: messagebox.showwarning("입력 오류", "공통 도곽 블록 이름을 입력하세요."); return
+        if not self.list_path: messagebox.showwarning("입력 오류", "도면목록표 파일을 선택하세요."); return
+        if not self.dwg_folders: messagebox.showwarning("입력 오류", "분석할 개별 도면 폴더를 하나 이상 추가하세요."); return
+        
+        # [스마트 분기] 체크박스가 켜져 있다면, slave(개별도면) 블록 이름을 별도로 챙김
+        if self.check_diff_name.get():
+            slave_blk = self.entry_slave_block.get().strip()
+            if not slave_blk: messagebox.showwarning("입력 오류", "개별도면용 도곽 이름을 입력하세요."); return
 
         self.btn_start.configure(state="disabled", text="분석 진행 중... ⏳")
-        
-        # 무거운 작업으로 인한 GUI 멈춤 방지를 위해 스레드(Thread) 실행
-        thread = threading.Thread(target=self.run_core_logic, args=(blk_name,), daemon=True)
+        thread = threading.Thread(target=self.run_core_logic, args=(master_blk, slave_blk), daemon=True)
         thread.start()
 
-    def run_core_logic(self, blk_name):
+    def run_core_logic(self, master_blk, slave_blk):
         try:
-            roi_config = load_roi_config(blk_name)
+            # 1. 박스 좌표(ROI)는 무조건 Master 기준(도면목록표)으로 불러옵니다.
+            roi_config = load_roi_config(master_blk)
             if not roi_config:
-                print(f"\n[오류] '{blk_name}'에 대한 구역 설정(JSON) 파일이 없습니다!")
-                print("캐드에서 SET_ROI 명령어로 구역을 먼저 지정해 주세요.")
+                print(f"\n[오류] '{master_blk}'에 대한 구역 설정(JSON) 파일이 없습니다!")
+                print("캐드에서 목록표 파일에 SET_ROI 명령어로 구역을 지정해 주세요.")
                 return
 
             base_w = float(roi_config.get('base_w', 841.0))
             base_h = float(roi_config.get('base_h', 594.0))
-            print(f"\n[성공] '{blk_name}' 설정을 로드했습니다. (원본크기: {base_w}x{base_h})")
+            print(f"\n[성공] '{master_blk}' 설정을 로드했습니다. (원본크기: {base_w}x{base_h})")
 
             xref_texts = []
             if self.xref_path and os.path.isfile(self.xref_path):
                 xref_texts = _parse_xref_original(self.xref_path)
 
             print("-" * 72)
-            
             실행폴더 = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
             최종_저장경로 = os.path.join(실행폴더, 리포트_이름)
 
-            list_데이터 = extract_dwg_list_table(self.list_path, blk_name, roi_config, base_w, base_h, xref_texts)
-            dwg_데이터 = extract_dwg_data_multiprocess(self.dwg_folders, blk_name, roi_config, base_w, base_h, xref_texts)
+            # 2. 목록표 스캔 (Master 블록 이름 사용)
+            list_데이터 = extract_dwg_list_table(self.list_path, master_blk, roi_config, base_w, base_h, xref_texts)
+            
+            # 3. 개별도면 스캔 (Slave 블록 이름 사용 - 같으면 Master 이름)
+            if master_blk != slave_blk: print(f"💡 [스마트 탐색 모드] 개별도면은 '{slave_blk}' 도곽 이름으로 탐색을 시작합니다.")
+            dwg_데이터 = extract_dwg_data_multiprocess(self.dwg_folders, slave_blk, roi_config, base_w, base_h, xref_texts)
 
+            # 4. 리포트 생성
             build_report(list_데이터, dwg_데이터, 최종_저장경로)
             
             print("-" * 72)
             print(f"[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
-            
-            # 작업 완료 후 엑셀이 있는 폴더 열기
             os.startfile(실행폴더)
 
-        except PermissionError:
-            print("\n[ERROR] 엑셀 파일이 이미 켜져 있습니다. 창을 닫고 다시 실행해 주세요.")
-        except Exception as e:
-            print(f"\n[ERROR] 시스템 오류 발생: {e}")
-        finally:
-            # 작업이 끝나면 버튼 상태 원상 복구 (메인 스레드에서 실행)
-            self.after(0, lambda: self.btn_start.configure(state="normal", text="검토 시작 🚀"))
+        except PermissionError: print("\n[ERROR] 엑셀 파일이 이미 켜져 있습니다. 창을 닫고 다시 실행해 주세요.")
+        except Exception as e: print(f"\n[ERROR] 시스템 오류 발생: {e}")
+        finally: self.after(0, lambda: self.btn_start.configure(state="normal", text="검토 시작 🚀"))
 
 # ============================================================================
 # 메인 실행
 # ============================================================================
 if __name__ == "__main__":
     import multiprocessing
-    multiprocessing.freeze_support()  # exe 패키징 시 필수
+    multiprocessing.freeze_support()
     
-    # ODA 엔진 설치 여부 확인
     if not _oda_환경_설정():
         root = tk.Tk(); root.withdraw()
         msg = "⚠️ CAD 분석 엔진(ODA)이 설치되어 있지 않습니다!\n\n확인을 누르면 다운로드 페이지가 열립니다."
-        if messagebox.askokcancel("엔진 설치 안내", msg):
-            webbrowser.open(ODA_DOWNLOAD_URL)
+        if messagebox.askokcancel("엔진 설치 안내", msg): webbrowser.open(ODA_DOWNLOAD_URL)
         sys.exit()
 
     app = AutoDWGApp()
