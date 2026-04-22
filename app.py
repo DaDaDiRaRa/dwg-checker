@@ -18,7 +18,7 @@ app.py  —  DWG 자동 검토기 v_6.7 Ultimate Edition (Kunwon Masterpiece)
 """
 
 from __future__ import annotations
-import glob, os, re, sys, webbrowser, json, math
+import glob, os, re, sys, webbrowser, json, math, logging
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
@@ -38,6 +38,23 @@ from tkinterdnd2 import TkinterDnD, DND_FILES  # [V6.7 추가] 드래그 앤 드
 # ============================================================================
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
+
+# ============================================================================
+# [로깅 설정] GUI 핸들러는 앱 초기화 시 추가, 파일 핸들러는 즉시 활성화
+# ============================================================================
+logger = logging.getLogger("AutoDWG")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.NullHandler())
+
+def _setup_file_logger():
+    log_dir = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'AutoDWG_Checker')
+    os.makedirs(log_dir, exist_ok=True)
+    fh = logging.FileHandler(os.path.join(log_dir, 'autodwg.log'), encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-8s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+
+_setup_file_logger()
 
 리포트_이름: str = "도면검토리포트_최종.xlsx"
 ODA_DOWNLOAD_URL = "https://www.opendesign.com/guestfiles/oda_file_converter"
@@ -165,7 +182,7 @@ def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
             txt = getattr(ent.dxf, 'tag', '').strip() 
             if not txt: txt = getattr(ent.dxf, 'text', '').strip() 
             if txt: 결과.append((px, py, txt, float(getattr(ent.dxf, "height", 10.0))))
-    except Exception: pass
+    except Exception as e: logger.debug("텍스트 엔티티 처리 건너뜀: %s", e)
     return 결과
 
 def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
@@ -181,8 +198,8 @@ def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
                         if v_ent.dxftype() in ["TEXT", "MTEXT", "LINE", "LWPOLYLINE", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(v_ent))
                         elif v_ent.dxftype() == "INSERT":
                             for v_att in getattr(v_ent, "attribs", []): texts.extend(_텍스트_데이터_추출(v_att))
-                except Exception: pass
-    except Exception: pass
+                except Exception as e: logger.debug("가상 엔티티 처리 건너뜀: %s", e)
+    except Exception as e: logger.debug("레이아웃 텍스트 수집 건너뜀: %s", e)
     seen, out = set(), []
     for x, y, txt, h in texts:
         clean = _정리문자열(txt); key = (round(x, 2), round(y, 2), clean)
@@ -190,24 +207,24 @@ def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
     return out
 
 def _parse_xref_original(xref_path: str) -> List[Tuple[float, float, str, float]]:
-    print(f"[XREF] 도곽 원본 스캔 중... ({os.path.basename(xref_path)})")
+    logger.info("[XREF] 도곽 원본 스캔 중... (%s)", os.path.basename(xref_path))
     try:
         doc = _cad_로드(Path(xref_path)); texts = []
-        for ent in doc.modelspace().query("TEXT MTEXT INSERT ATTDEF"): 
+        for ent in doc.modelspace().query("TEXT MTEXT INSERT ATTDEF"):
             if ent.dxftype() in ["TEXT", "MTEXT", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(ent))
             elif ent.dxftype() == "INSERT":
                 for att in getattr(ent, "attribs", []): texts.extend(_텍스트_데이터_추출(att))
                 try:
                     for v_ent in ent.virtual_entities():
                         if v_ent.dxftype() in ["TEXT", "MTEXT", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(v_ent))
-                except Exception: pass
+                except Exception as e: logger.debug("XREF 가상 엔티티 처리 건너뜀: %s", e)
         seen, out = set(), []
         for x, y, txt, h in texts:
             clean = _정리문자열(txt); key = (round(x, 2), round(y, 2), clean)
             if key not in seen: seen.add(key); out.append((float(x), float(y), clean, float(h)))
-        print(f"  -> 엑스레이 스캔 성공! {len(out)}개의 고정 텍스트 암기 완료.")
+        logger.info("  -> 엑스레이 스캔 성공! %d개의 고정 텍스트 암기 완료.", len(out))
         return out
-    except Exception as e: print(f"  -> [XREF 에러] {e}"); return []
+    except Exception as e: logger.error("XREF 스캔 실패: %s", e); return []
 
 def _transform_xref_texts(xref_texts: List[Tuple[float, float, str, float]], ix: float, iy: float, xscale: float, yscale: float, rot_deg: float) -> List[Tuple[float, float, str, float]]:
     transformed = []; rad = math.radians(rot_deg); cos_val = math.cos(rad); sin_val = math.sin(rad)
@@ -298,7 +315,7 @@ def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], head
 # 2. 도면목록표 및 개별 도면 파싱 코어 (Master/Slave 분리 적용)
 # ============================================================================
 def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> pd.DataFrame:
-    print(f"\n[LIST] DWG 도면목록표 분석 시작: {os.path.basename(dwg_path)}")
+    logger.info("[LIST] DWG 도면목록표 분석 시작: %s", os.path.basename(dwg_path))
     데이터, 목표블록 = [], block_name.strip().lower()
     list_rois = roi_cfg.get('list_rois', [])
     global_ignores_stripped = [h.replace(" ", "").upper() for h in GLOBAL_IGNORE_HEADERS]
@@ -422,7 +439,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
 
                         a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x, is_list_table=True)
                         데이터.append({"도면번호(LIST)": 번호, "구분_LIST(동)": current_dong if current_dong != "공통" else "", "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
-    except Exception as e: print(f"[ERROR] 목록표 분석 중 오류: {e}")
+    except Exception as e: logger.error("목록표 분석 중 오류: %s", e)
     df = pd.DataFrame(데이터)
     return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(동)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"]) if df.empty else df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
 
@@ -509,9 +526,9 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str,
         if 폴더.exists(): 모든_캐드파일.extend([str(p) for p in 폴더.iterdir() if p.is_file() and p.suffix.lower() in [".dwg", ".dxf"]])
     캐드파일들 = sorted(list(set(모든_캐드파일)))
     if not 캐드파일들:
-        print("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
+        logger.warning("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
 
-    print(f"\n[CAD ] 총 {len(캐드파일들)}개의 개별 도면 분석 중... (터보 모드 가동 🚀)")
+    logger.info("[CAD ] 총 %d개의 개별 도면 분석 중... (터보 모드 가동 🚀)", len(캐드파일들))
     최종_데이터 = []
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {executor.submit(_process_single_dwg, (path, slave_block_name.strip().lower(), roi_cfg, base_w, base_h, xref_texts)): path for path in 캐드파일들}
@@ -520,14 +537,14 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str,
             try:
                 결과, 에러 = future.result()
                 if 결과: 최종_데이터.extend(결과)
-                print(f"   [{i}/{len(캐드파일들)}] {'완료' if 결과 else '패스'}: {os.path.basename(경로)} ({에러 if 에러 else '성공'})")
-            except Exception as e: print(f"   [{i}/{len(캐드파일들)}] 시스템 오류: {os.path.basename(경로)} ({e})")
+                logger.info("   [%d/%d] %s: %s (%s)", i, len(캐드파일들), '완료' if 결과 else '패스', os.path.basename(경로), 에러 if 에러 else '성공')
+            except Exception as e: logger.error("   [%d/%d] 시스템 오류: %s (%s)", i, len(캐드파일들), os.path.basename(경로), e)
     
     if not 최종_데이터: return pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
     return pd.DataFrame(최종_데이터)
 
 def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
-    if list_df.empty and dwg_df.empty: print("[알림] 추출된 데이터가 없어 엑셀 리포트를 생성하지 않습니다."); return
+    if list_df.empty and dwg_df.empty: logger.warning("[알림] 추출된 데이터가 없어 엑셀 리포트를 생성하지 않습니다."); return
 
     lst, dwg = list_df.copy(), dwg_df.copy()
     if "도면번호(LIST)" not in lst.columns: lst["도면번호(LIST)"] = ""
@@ -596,22 +613,23 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
                     ws.cell(row, h[f"축척_{s}(DWG)"]).fill = 빨간색
 
     wb.save(out_path)
-    print(f"\n[XLSX] 리포트 저장 완료: {out_path}")
+    logger.info("[XLSX] 리포트 저장 완료: %s", out_path)
 
 # ============================================================================
 # 3. [GUI 구축] CustomTkinter + TkinterDnD (드래그 앤 드롭 지원)
 # ============================================================================
-class StdoutRedirector:
+class GUILogHandler(logging.Handler):
+    """로그 레코드를 GUI 텍스트박스에 출력하는 핸들러."""
     def __init__(self, textbox: ctk.CTkTextbox):
+        super().__init__()
         self.textbox = textbox
 
-    def write(self, string):
+    def emit(self, record: logging.LogRecord):
+        msg = self.format(record)
         self.textbox.configure(state="normal")
-        self.textbox.insert("end", string)
+        self.textbox.insert("end", msg + "\n")
         self.textbox.see("end")
         self.textbox.configure(state="disabled")
-
-    def flush(self): pass
 
 # [핵심] ctk.CTk와 TkinterDnD.DnDWrapper를 결합하여 D&D 윈도우 생성
 class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -628,12 +646,16 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.dwg_folders = []
 
         self._build_ui()
-        sys.stdout = StdoutRedirector(self.log_box)
-        
-        print("=" * 72)
-        print(" AutoDWG Cross-Checker V6.7 (Ultimate Edition)")
-        print("=" * 72)
-        print(" 환영합니다! 파일이나 폴더를 '드래그 앤 드롭' 하거나 버튼으로 추가하세요.\n")
+
+        gui_handler = GUILogHandler(self.log_box)
+        gui_handler.setLevel(logging.DEBUG)
+        gui_handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(gui_handler)
+
+        logger.info("=" * 72)
+        logger.info(" AutoDWG Cross-Checker V6.7 (Ultimate Edition)")
+        logger.info("=" * 72)
+        logger.info(" 환영합니다! 파일이나 폴더를 '드래그 앤 드롭' 하거나 버튼으로 추가하세요.\n")
 
     def _parse_dnd_paths(self, dnd_data):
         # 윈도우 탐색기에서 넘어온 복잡한 경로 문자열({} 포함 등)을 깔끔한 리스트로 분리
@@ -744,14 +766,14 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self.lbl_xref.configure(text=os.path.basename(self.xref_path), text_color="black")
             base_name = os.path.splitext(os.path.basename(self.xref_path))[0]
             self.entry_block_name.delete(0, "end"); self.entry_block_name.insert(0, base_name)
-            print(f"[알림] 드래그 앤 드롭: 원본 도곽 이름({base_name}) 자동 입력됨.")
+            logger.info("[알림] 드래그 앤 드롭: 원본 도곽 이름(%s) 자동 입력됨.", base_name)
 
     def drop_list(self, event):
         paths = self._parse_dnd_paths(event.data)
         if paths and paths[0].lower().endswith(('.dwg', '.dxf')):
             self.list_path = paths[0]
             self.lbl_list.configure(text=os.path.basename(self.list_path), text_color="blue")
-            print(f"[알림] 드래그 앤 드롭: 도면목록표 인식 완료.")
+            logger.info("[알림] 드래그 앤 드롭: 도면목록표 인식 완료.")
 
     def drop_folders(self, event):
         paths = self._parse_dnd_paths(event.data)
@@ -768,7 +790,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self.lbl_xref.configure(text=os.path.basename(path), text_color="black")
             base_name = os.path.splitext(os.path.basename(path))[0]
             self.entry_block_name.delete(0, "end"); self.entry_block_name.insert(0, base_name)
-            print(f"[알림] 원본 파일명 기반으로 도곽 블록 이름({base_name})이 자동 입력되었습니다.")
+            logger.info("[알림] 원본 파일명 기반으로 도곽 블록 이름(%s)이 자동 입력되었습니다.", base_name)
 
     def select_list(self):
         path = filedialog.askopenfilename(title="도면목록표 파일 선택", filetypes=[("AutoCAD Files", "*.dwg *.dxf")])
@@ -817,38 +839,38 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
             # 1. 박스 좌표(ROI)는 무조건 Master 기준(도면목록표)으로 불러옵니다.
             roi_config = load_roi_config(master_blk)
             if not roi_config:
-                print(f"\n[오류] '{master_blk}'에 대한 구역 설정(JSON) 파일이 없습니다!")
-                print("캐드에서 목록표 파일에 SET_ROI 명령어로 구역을 지정해 주세요.")
+                logger.error("[오류] '%s'에 대한 구역 설정(JSON) 파일이 없습니다!", master_blk)
+                logger.error("캐드에서 목록표 파일에 SET_ROI 명령어로 구역을 지정해 주세요.")
                 return
 
             base_w = float(roi_config.get('base_w', 841.0))
             base_h = float(roi_config.get('base_h', 594.0))
-            print(f"\n[성공] '{master_blk}' 설정을 로드했습니다. (원본크기: {base_w}x{base_h})")
+            logger.info("[성공] '%s' 설정을 로드했습니다. (원본크기: %.0fx%.0f)", master_blk, base_w, base_h)
 
             xref_texts = []
             if self.xref_path and os.path.isfile(self.xref_path):
                 xref_texts = _parse_xref_original(self.xref_path)
 
-            print("-" * 72)
+            logger.info("-" * 72)
             실행폴더 = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
             최종_저장경로 = os.path.join(실행폴더, 리포트_이름)
 
             # 2. 목록표 스캔 (Master 블록 이름 사용)
             list_데이터 = extract_dwg_list_table(self.list_path, master_blk, roi_config, base_w, base_h, xref_texts)
-            
+
             # 3. 개별도면 스캔 (Slave 블록 이름 사용 - 같으면 Master 이름)
-            if master_blk != slave_blk: print(f"💡 [스마트 탐색 모드] 개별도면은 '{slave_blk}' 도곽 이름으로 탐색을 시작합니다.")
+            if master_blk != slave_blk: logger.info("💡 [스마트 탐색 모드] 개별도면은 '%s' 도곽 이름으로 탐색을 시작합니다.", slave_blk)
             dwg_데이터 = extract_dwg_data_multiprocess(self.dwg_folders, slave_blk, roi_config, base_w, base_h, xref_texts)
 
             # 4. 리포트 생성
             build_report(list_데이터, dwg_데이터, 최종_저장경로)
-            
-            print("-" * 72)
-            print(f"[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
+
+            logger.info("-" * 72)
+            logger.info("[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
             os.startfile(실행폴더)
 
-        except PermissionError: print("\n[ERROR] 엑셀 파일이 이미 켜져 있습니다. 창을 닫고 다시 실행해 주세요.")
-        except Exception as e: print(f"\n[ERROR] 시스템 오류 발생: {e}")
+        except PermissionError: logger.error("[ERROR] 엑셀 파일이 이미 켜져 있습니다. 창을 닫고 다시 실행해 주세요.")
+        except Exception as e: logger.error("[ERROR] 시스템 오류 발생: %s", e)
         finally: self.after(0, lambda: self.btn_start.configure(state="normal", text="검토 시작 🚀"))
 
 # ============================================================================
